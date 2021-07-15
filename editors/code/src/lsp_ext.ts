@@ -27,6 +27,18 @@ export const syntaxTree = new lc.RequestType<SyntaxTreeParams, string, void>("ru
 
 export const viewHir = new lc.RequestType<lc.TextDocumentPositionParams, string, void>("rust-analyzer/viewHir");
 
+export interface ViewItemTreeParams {
+    textDocument: lc.TextDocumentIdentifier;
+}
+
+export const viewItemTree = new lc.RequestType<ViewItemTreeParams, string, void>("rust-analyzer/viewItemTree");
+
+export interface ViewCrateGraphParams {
+    full: boolean;
+}
+
+export const viewCrateGraph = new lc.RequestType<ViewCrateGraphParams, string, void>("rust-analyzer/viewCrateGraph");
+
 export interface ExpandMacroParams {
     textDocument: lc.TextDocumentIdentifier;
     position: lc.Position;

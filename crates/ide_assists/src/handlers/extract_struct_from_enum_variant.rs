@@ -5,20 +5,25 @@ use hir::{Module, ModuleDef, Name, Variant};
 use ide_db::{
     defs::Definition,
     helpers::{
-        insert_use::{insert_use, ImportScope},
+        insert_use::{insert_use, ImportScope, InsertUseConfig},
         mod_path_to_ast,
     },
     search::FileReference,
     RootDatabase,
 };
+use itertools::Itertools;
 use rustc_hash::FxHashSet;
 use syntax::{
-    algo::{find_node_at_offset, SyntaxRewriter},
-    ast::{self, edit::IndentLevel, make, AstNode, NameOwner, VisibilityOwner},
-    SourceFile, SyntaxElement, SyntaxNode, T,
+    ast::{
+        self, make, AstNode, AttrsOwner, GenericParamsOwner, NameOwner, TypeBoundsOwner,
+        VisibilityOwner,
+    },
+    match_ast,
+    ted::{self, Position},
+    SyntaxNode, T,
 };
 
-use crate::{AssistContext, AssistId, AssistKind, Assists};
+use crate::{assist_context::AssistBuilder, AssistContext, AssistId, AssistKind, Assists};
 
 // Assist: extract_struct_from_enum_variant
 //
@@ -43,6 +48,7 @@ pub(crate) fn extract_struct_from_enum_variant(
     let variant_name = variant.name()?;
     let variant_hir = ctx.sema.to_def(&variant)?;
     if existing_definition(ctx.db(), &variant_name, &variant_hir) {
+        cov_mark::hit!(test_extract_enum_not_applicable_if_struct_exists);
         return None;
     }
 
@@ -62,40 +68,48 @@ pub(crate) fn extract_struct_from_enum_variant(
             let mut visited_modules_set = FxHashSet::default();
             let current_module = enum_hir.module(ctx.db());
             visited_modules_set.insert(current_module);
-            let mut def_rewriter = None;
+            // record file references of the file the def resides in, we only want to swap to the edited file in the builder once
+            let mut def_file_references = None;
             for (file_id, references) in usages {
-                let mut rewriter = SyntaxRewriter::default();
-                let source_file = ctx.sema.parse(file_id);
-                for reference in references {
-                    update_reference(
-                        ctx,
-                        &mut rewriter,
-                        reference,
-                        &source_file,
-                        &enum_module_def,
-                        &variant_hir_name,
-                        &mut visited_modules_set,
-                    );
-                }
                 if file_id == ctx.frange.file_id {
-                    def_rewriter = Some(rewriter);
+                    def_file_references = Some(references);
                     continue;
                 }
                 builder.edit_file(file_id);
-                builder.rewrite(rewriter);
+                let processed = process_references(
+                    ctx,
+                    builder,
+                    &mut visited_modules_set,
+                    &enum_module_def,
+                    &variant_hir_name,
+                    references,
+                );
+                processed.into_iter().for_each(|(path, node, import)| {
+                    apply_references(ctx.config.insert_use, path, node, import)
+                });
             }
-            let mut rewriter = def_rewriter.unwrap_or_default();
-            update_variant(&mut rewriter, &variant);
-            extract_struct_def(
-                &mut rewriter,
-                &enum_ast,
-                variant_name.clone(),
-                &field_list,
-                &variant.parent_enum().syntax().clone().into(),
-                enum_ast.visibility(),
-            );
             builder.edit_file(ctx.frange.file_id);
-            builder.rewrite(rewriter);
+            let variant = builder.make_mut(variant.clone());
+            if let Some(references) = def_file_references {
+                let processed = process_references(
+                    ctx,
+                    builder,
+                    &mut visited_modules_set,
+                    &enum_module_def,
+                    &variant_hir_name,
+                    references,
+                );
+                processed.into_iter().for_each(|(path, node, import)| {
+                    apply_references(ctx.config.insert_use, path, node, import)
+                });
+            }
+
+            let def = create_struct_def(variant_name.clone(), &field_list, &enum_ast);
+            let start_offset = &variant.parent_enum().syntax().clone();
+            ted::insert_raw(ted::Position::before(start_offset), def.syntax());
+            ted::insert_raw(ted::Position::before(start_offset), &make::tokens::blank_line());
+
+            update_variant(&variant, enum_ast.generic_param_list());
         },
     )
 }
@@ -136,115 +150,157 @@ fn existing_definition(db: &RootDatabase, variant_name: &ast::Name, variant: &Va
         .any(|(name, _)| name.to_string() == variant_name.to_string())
 }
 
-fn insert_import(
-    ctx: &AssistContext,
-    rewriter: &mut SyntaxRewriter,
-    scope_node: &SyntaxNode,
-    module: &Module,
-    enum_module_def: &ModuleDef,
-    variant_hir_name: &Name,
-) -> Option<()> {
-    let db = ctx.db();
-    let mod_path =
-        module.find_use_path_prefixed(db, *enum_module_def, ctx.config.insert_use.prefix_kind);
-    if let Some(mut mod_path) = mod_path {
-        mod_path.pop_segment();
-        mod_path.push_segment(variant_hir_name.clone());
-        let scope = ImportScope::find_insert_use_container(scope_node, &ctx.sema)?;
-        *rewriter += insert_use(&scope, mod_path_to_ast(&mod_path), ctx.config.insert_use);
-    }
-    Some(())
-}
-
-fn extract_struct_def(
-    rewriter: &mut SyntaxRewriter,
-    enum_: &ast::Enum,
+fn create_struct_def(
     variant_name: ast::Name,
     field_list: &Either<ast::RecordFieldList, ast::TupleFieldList>,
-    start_offset: &SyntaxElement,
-    visibility: Option<ast::Visibility>,
-) -> Option<()> {
-    let pub_vis = Some(make::visibility_pub());
-    let field_list = match field_list {
-        Either::Left(field_list) => {
-            make::record_field_list(field_list.fields().flat_map(|field| {
-                Some(make::record_field(pub_vis.clone(), field.name()?, field.ty()?))
-            }))
-            .into()
-        }
-        Either::Right(field_list) => make::tuple_field_list(
-            field_list
-                .fields()
-                .flat_map(|field| Some(make::tuple_field(pub_vis.clone(), field.ty()?))),
-        )
-        .into(),
+    enum_: &ast::Enum,
+) -> ast::Struct {
+    let pub_vis = make::visibility_pub();
+
+    let insert_pub = |node: &'_ SyntaxNode| {
+        let pub_vis = pub_vis.clone_for_update();
+        ted::insert(ted::Position::before(node), pub_vis.syntax());
     };
 
-    rewriter.insert_before(
-        start_offset,
-        make::struct_(visibility, variant_name, None, field_list).syntax(),
-    );
-    rewriter.insert_before(start_offset, &make::tokens::blank_line());
+    // for fields without any existing visibility, use pub visibility
+    let field_list = match field_list {
+        Either::Left(field_list) => {
+            let field_list = field_list.clone_for_update();
 
-    if let indent_level @ 1..=usize::MAX = IndentLevel::from_node(enum_.syntax()).0 as usize {
-        rewriter
-            .insert_before(start_offset, &make::tokens::whitespace(&" ".repeat(4 * indent_level)));
-    }
-    Some(())
+            field_list
+                .fields()
+                .filter(|field| field.visibility().is_none())
+                .filter_map(|field| field.name())
+                .for_each(|it| insert_pub(it.syntax()));
+
+            field_list.into()
+        }
+        Either::Right(field_list) => {
+            let field_list = field_list.clone_for_update();
+
+            field_list
+                .fields()
+                .filter(|field| field.visibility().is_none())
+                .filter_map(|field| field.ty())
+                .for_each(|it| insert_pub(it.syntax()));
+
+            field_list.into()
+        }
+    };
+
+    // FIXME: This uses all the generic params of the enum, but the variant might not use all of them.
+    let strukt =
+        make::struct_(enum_.visibility(), variant_name, enum_.generic_param_list(), field_list)
+            .clone_for_update();
+
+    // copy attributes
+    ted::insert_all(
+        Position::first_child_of(strukt.syntax()),
+        enum_.attrs().map(|it| it.syntax().clone_for_update().into()).collect(),
+    );
+    strukt
 }
 
-fn update_variant(rewriter: &mut SyntaxRewriter, variant: &ast::Variant) -> Option<()> {
+fn update_variant(variant: &ast::Variant, generic: Option<ast::GenericParamList>) -> Option<()> {
     let name = variant.name()?;
-    let tuple_field = make::tuple_field(None, make::ty(&name.text()));
+    let ty = match generic {
+        // FIXME: This uses all the generic params of the enum, but the variant might not use all of them.
+        Some(gpl) => {
+            let gpl = gpl.clone_for_update();
+            gpl.generic_params().for_each(|gp| {
+                match gp {
+                    ast::GenericParam::LifetimeParam(it) => it.type_bound_list(),
+                    ast::GenericParam::TypeParam(it) => it.type_bound_list(),
+                    ast::GenericParam::ConstParam(_) => return,
+                }
+                .map(|it| it.remove());
+            });
+            make::ty(&format!("{}<{}>", name.text(), gpl.generic_params().join(", ")))
+        }
+        None => make::ty(&name.text()),
+    };
+    let tuple_field = make::tuple_field(None, ty);
     let replacement = make::variant(
         name,
         Some(ast::FieldList::TupleFieldList(make::tuple_field_list(iter::once(tuple_field)))),
-    );
-    rewriter.replace(variant.syntax(), replacement.syntax());
+    )
+    .clone_for_update();
+    ted::replace(variant.syntax(), replacement.syntax());
     Some(())
 }
 
-fn update_reference(
+fn apply_references(
+    insert_use_cfg: InsertUseConfig,
+    segment: ast::PathSegment,
+    node: SyntaxNode,
+    import: Option<(ImportScope, hir::ModPath)>,
+) {
+    if let Some((scope, path)) = import {
+        insert_use(&scope, mod_path_to_ast(&path), &insert_use_cfg);
+    }
+    // deep clone to prevent cycle
+    let path = make::path_from_segments(iter::once(segment.clone_subtree()), false);
+    ted::insert_raw(ted::Position::before(segment.syntax()), path.clone_for_update().syntax());
+    ted::insert_raw(ted::Position::before(segment.syntax()), make::token(T!['(']));
+    ted::insert_raw(ted::Position::after(&node), make::token(T![')']));
+}
+
+fn process_references(
     ctx: &AssistContext,
-    rewriter: &mut SyntaxRewriter,
-    reference: FileReference,
-    source_file: &SourceFile,
+    builder: &mut AssistBuilder,
+    visited_modules: &mut FxHashSet<Module>,
     enum_module_def: &ModuleDef,
     variant_hir_name: &Name,
-    visited_modules_set: &mut FxHashSet<Module>,
-) -> Option<()> {
-    let offset = reference.range.start();
-    let (segment, expr) = if let Some(path_expr) =
-        find_node_at_offset::<ast::PathExpr>(source_file.syntax(), offset)
-    {
-        // tuple variant
-        (path_expr.path()?.segment()?, path_expr.syntax().parent()?)
-    } else if let Some(record_expr) =
-        find_node_at_offset::<ast::RecordExpr>(source_file.syntax(), offset)
-    {
-        // record variant
-        (record_expr.path()?.segment()?, record_expr.syntax().clone())
-    } else {
-        return None;
-    };
+    refs: Vec<FileReference>,
+) -> Vec<(ast::PathSegment, SyntaxNode, Option<(ImportScope, hir::ModPath)>)> {
+    // we have to recollect here eagerly as we are about to edit the tree we need to calculate the changes
+    // and corresponding nodes up front
+    refs.into_iter()
+        .flat_map(|reference| {
+            let (segment, scope_node, module) = reference_to_node(&ctx.sema, reference)?;
+            let segment = builder.make_mut(segment);
+            let scope_node = builder.make_syntax_mut(scope_node);
+            if !visited_modules.contains(&module) {
+                let mod_path = module.find_use_path_prefixed(
+                    ctx.sema.db,
+                    *enum_module_def,
+                    ctx.config.insert_use.prefix_kind,
+                );
+                if let Some(mut mod_path) = mod_path {
+                    mod_path.pop_segment();
+                    mod_path.push_segment(variant_hir_name.clone());
+                    let scope = ImportScope::find_insert_use_container(&scope_node)?;
+                    visited_modules.insert(module);
+                    return Some((segment, scope_node, Some((scope, mod_path))));
+                }
+            }
+            Some((segment, scope_node, None))
+        })
+        .collect()
+}
 
-    let module = ctx.sema.scope(&expr).module()?;
-    if !visited_modules_set.contains(&module) {
-        if insert_import(ctx, rewriter, &expr, &module, enum_module_def, variant_hir_name).is_some()
-        {
-            visited_modules_set.insert(module);
+fn reference_to_node(
+    sema: &hir::Semantics<RootDatabase>,
+    reference: FileReference,
+) -> Option<(ast::PathSegment, SyntaxNode, hir::Module)> {
+    let segment =
+        reference.name.as_name_ref()?.syntax().parent().and_then(ast::PathSegment::cast)?;
+    let parent = segment.parent_path().syntax().parent()?;
+    let expr_or_pat = match_ast! {
+        match parent {
+            ast::PathExpr(_it) => parent.parent()?,
+            ast::RecordExpr(_it) => parent,
+            ast::TupleStructPat(_it) => parent,
+            ast::RecordPat(_it) => parent,
+            _ => return None,
         }
-    }
-    rewriter.insert_after(segment.syntax(), &make::token(T!['(']));
-    rewriter.insert_after(segment.syntax(), segment.syntax());
-    rewriter.insert_after(&expr, &make::token(T![')']));
-    Some(())
+    };
+    let module = sema.scope(&expr_or_pat).module()?;
+    Some((segment, expr_or_pat, module))
 }
 
 #[cfg(test)]
 mod tests {
-    use ide_db::helpers::FamousDefs;
-
     use crate::tests::{check_assist, check_assist_not_applicable};
 
     use super::*;
@@ -277,6 +333,132 @@ enum A { One(One) }"#,
             extract_struct_from_enum_variant,
             "enum A { $0One { foo: u32 } }",
             r#"struct One{ pub foo: u32 }
+
+enum A { One(One) }"#,
+        );
+    }
+
+    #[test]
+    fn test_extract_struct_carries_over_generics() {
+        check_assist(
+            extract_struct_from_enum_variant,
+            r"enum En<T> { Var { a: T$0 } }",
+            r#"struct Var<T>{ pub a: T }
+
+enum En<T> { Var(Var<T>) }"#,
+        );
+    }
+
+    #[test]
+    fn test_extract_struct_carries_over_attributes() {
+        check_assist(
+            extract_struct_from_enum_variant,
+            r#"#[derive(Debug)]
+#[derive(Clone)]
+enum Enum { Variant{ field: u32$0 } }"#,
+            r#"#[derive(Debug)]#[derive(Clone)] struct Variant{ pub field: u32 }
+
+#[derive(Debug)]
+#[derive(Clone)]
+enum Enum { Variant(Variant) }"#,
+        );
+    }
+
+    #[test]
+    fn test_extract_struct_keep_comments_and_attrs_one_field_named() {
+        check_assist(
+            extract_struct_from_enum_variant,
+            r#"
+enum A {
+    $0One {
+        // leading comment
+        /// doc comment
+        #[an_attr]
+        foo: u32
+        // trailing comment
+    }
+}"#,
+            r#"
+struct One{
+        // leading comment
+        /// doc comment
+        #[an_attr]
+        pub foo: u32
+        // trailing comment
+    }
+
+enum A {
+    One(One)
+}"#,
+        );
+    }
+
+    #[test]
+    fn test_extract_struct_keep_comments_and_attrs_several_fields_named() {
+        check_assist(
+            extract_struct_from_enum_variant,
+            r#"
+enum A {
+    $0One {
+        // comment
+        /// doc
+        #[attr]
+        foo: u32,
+        // comment
+        #[attr]
+        /// doc
+        bar: u32
+    }
+}"#,
+            r#"
+struct One{
+        // comment
+        /// doc
+        #[attr]
+        pub foo: u32,
+        // comment
+        #[attr]
+        /// doc
+        pub bar: u32
+    }
+
+enum A {
+    One(One)
+}"#,
+        );
+    }
+
+    #[test]
+    fn test_extract_struct_keep_comments_and_attrs_several_fields_tuple() {
+        check_assist(
+            extract_struct_from_enum_variant,
+            "enum A { $0One(/* comment */ #[attr] u32, /* another */ u32 /* tail */) }",
+            r#"
+struct One(/* comment */ #[attr] pub u32, /* another */ pub u32 /* tail */);
+
+enum A { One(One) }"#,
+        );
+    }
+
+    #[test]
+    fn test_extract_struct_keep_existing_visibility_named() {
+        check_assist(
+            extract_struct_from_enum_variant,
+            "enum A { $0One{ pub a: u32, pub(crate) b: u32, pub(super) c: u32, d: u32 } }",
+            r#"
+struct One{ pub a: u32, pub(crate) b: u32, pub(super) c: u32, pub d: u32 }
+
+enum A { One(One) }"#,
+        );
+    }
+
+    #[test]
+    fn test_extract_struct_keep_existing_visibility_tuple() {
+        check_assist(
+            extract_struct_from_enum_variant,
+            "enum A { $0One(pub u32, pub(crate) u32, pub(super) u32, u32) }",
+            r#"
+struct One(pub u32, pub(crate) u32, pub(super) u32, pub u32);
 
 enum A { One(One) }"#,
         );
@@ -345,7 +527,7 @@ mod my_mod {
 
         pub struct MyField(pub u8, pub u8);
 
-        pub enum MyEnum {
+pub enum MyEnum {
             MyField(MyField),
         }
     }
@@ -367,7 +549,7 @@ enum E {
 }
 
 fn f() {
-    let e = E::V { i: 9, j: 2 };
+    let E::V { i, j } = E::V { i: 9, j: 2 };
 }
 "#,
             r#"
@@ -378,7 +560,34 @@ enum E {
 }
 
 fn f() {
-    let e = E::V(V { i: 9, j: 2 });
+    let E::V(V { i, j }) = E::V(V { i: 9, j: 2 });
+}
+"#,
+        )
+    }
+
+    #[test]
+    fn extract_record_fix_references2() {
+        check_assist(
+            extract_struct_from_enum_variant,
+            r#"
+enum E {
+    $0V(i32, i32)
+}
+
+fn f() {
+    let E::V(i, j) = E::V(9, 2);
+}
+"#,
+            r#"
+struct V(pub i32, pub i32);
+
+enum E {
+    V(V)
+}
+
+fn f() {
+    let E::V(V(i, j)) = E::V(V(9, 2));
 }
 "#,
         )
@@ -481,37 +690,35 @@ fn foo() {
         );
     }
 
-    fn check_not_applicable(ra_fixture: &str) {
-        let fixture =
-            format!("//- /main.rs crate:main deps:core\n{}\n{}", ra_fixture, FamousDefs::FIXTURE);
-        check_assist_not_applicable(extract_struct_from_enum_variant, &fixture)
-    }
-
     #[test]
     fn test_extract_enum_not_applicable_for_element_with_no_fields() {
-        check_not_applicable("enum A { $0One }");
+        check_assist_not_applicable(extract_struct_from_enum_variant, r#"enum A { $0One }"#);
     }
 
     #[test]
     fn test_extract_enum_not_applicable_if_struct_exists() {
-        check_not_applicable(
-            r#"struct One;
-        enum A { $0One(u8, u32) }"#,
+        cov_mark::check!(test_extract_enum_not_applicable_if_struct_exists);
+        check_assist_not_applicable(
+            extract_struct_from_enum_variant,
+            r#"
+struct One;
+enum A { $0One(u8, u32) }
+"#,
         );
     }
 
     #[test]
     fn test_extract_not_applicable_one_field() {
-        check_not_applicable(r"enum A { $0One(u32) }");
+        check_assist_not_applicable(extract_struct_from_enum_variant, r"enum A { $0One(u32) }");
     }
 
     #[test]
     fn test_extract_not_applicable_no_field_tuple() {
-        check_not_applicable(r"enum A { $0None() }");
+        check_assist_not_applicable(extract_struct_from_enum_variant, r"enum A { $0None() }");
     }
 
     #[test]
     fn test_extract_not_applicable_no_field_named() {
-        check_not_applicable(r"enum A { $0None {} }");
+        check_assist_not_applicable(extract_struct_from_enum_variant, r"enum A { $0None {} }");
     }
 }

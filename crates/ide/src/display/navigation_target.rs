@@ -1,4 +1,4 @@
-//! FIXME: write short doc here
+//! See [`NavigationTarget`].
 
 use std::fmt;
 
@@ -20,7 +20,7 @@ use syntax::{
 
 use crate::FileSymbol;
 
-/// `NavigationTarget` represents and element in the editor's UI which you can
+/// `NavigationTarget` represents an element in the editor's UI which you can
 /// click on to navigate to a particular piece of code.
 ///
 /// Typically, a `NavigationTarget` corresponds to some element in the source
@@ -35,12 +35,10 @@ pub struct NavigationTarget {
     /// Clients should use this range to answer "is the cursor inside the
     /// element?" question.
     pub full_range: TextRange,
-    /// A "most interesting" range withing the `full_range`.
+    /// A "most interesting" range within the `full_range`.
     ///
     /// Typically, `full_range` is the whole syntax node, including doc
-    /// comments, and `focus_range` is the range of the identifier. "Most
-    /// interesting" range within the full range, typically the range of
-    /// identifier.
+    /// comments, and `focus_range` is the range of the identifier.
     ///
     /// Clients should place the cursor on this range when navigating to this target.
     pub focus_range: Option<TextRange>,
@@ -444,10 +442,10 @@ impl TryToNav for hir::TypeParam {
     fn try_to_nav(&self, db: &RootDatabase) -> Option<NavigationTarget> {
         let src = self.source(db)?;
         let full_range = match &src.value {
-            Either::Left(it) => it
+            Either::Left(type_param) => type_param.syntax().text_range(),
+            Either::Right(trait_) => trait_
                 .name()
-                .map_or_else(|| it.syntax().text_range(), |name| name.syntax().text_range()),
-            Either::Right(it) => it.syntax().text_range(),
+                .map_or_else(|| trait_.syntax().text_range(), |name| name.syntax().text_range()),
         };
         let focus_range = match &src.value {
             Either::Left(it) => it.name(),

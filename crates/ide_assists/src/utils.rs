@@ -4,28 +4,26 @@ pub(crate) mod suggest_name;
 
 use std::ops;
 
-use ast::TypeBoundsOwner;
 use hir::{Adt, HasSource, Semantics};
 use ide_db::{
     helpers::{FamousDefs, SnippetCap},
+    path_transform::PathTransform,
     RootDatabase,
 };
 use itertools::Itertools;
 use stdx::format_to;
 use syntax::{
-    ast::edit::AstNodeEdit,
-    ast::AttrsOwner,
-    ast::NameOwner,
-    ast::{self, edit, make, ArgListOwner, GenericParamsOwner},
-    AstNode, Direction, SmolStr,
+    ast::{
+        self,
+        edit::{self, AstNodeEdit},
+        make, ArgListOwner, AttrsOwner, GenericParamsOwner, NameOwner, TypeBoundsOwner,
+    },
+    ted, AstNode, Direction, SmolStr,
     SyntaxKind::*,
     SyntaxNode, TextSize, T,
 };
 
-use crate::{
-    assist_context::{AssistBuilder, AssistContext},
-    ast_transform::{self, AstTransform, QualifyPaths, SubstituteTypeParams},
-};
+use crate::assist_context::{AssistBuilder, AssistContext};
 
 pub(crate) fn unwrap_trivial_block(block: ast::BlockExpr) -> ast::Expr {
     extract_trivial_expression(&block)
@@ -50,15 +48,14 @@ pub fn extract_trivial_expression(block: &ast::BlockExpr) -> Option<ast::Expr> {
         return Some(expr);
     }
     // Unwrap `{ continue; }`
-    let (stmt,) = block.statements().next_tuple()?;
+    let stmt = block.statements().next()?;
     if let ast::Stmt::ExprStmt(expr_stmt) = stmt {
         if has_anything_else(expr_stmt.syntax()) {
             return None;
         }
         let expr = expr_stmt.expr()?;
-        match expr.syntax().kind() {
-            CONTINUE_EXPR | BREAK_EXPR | RETURN_EXPR => return Some(expr),
-            _ => (),
+        if matches!(expr.syntax().kind(), CONTINUE_EXPR | BREAK_EXPR | RETURN_EXPR) {
+            return Some(expr);
         }
     }
     None
@@ -73,11 +70,7 @@ pub fn extract_trivial_expression(block: &ast::BlockExpr) -> Option<ast::Expr> {
 pub fn test_related_attribute(fn_def: &ast::Fn) -> Option<ast::Attr> {
     fn_def.attrs().find_map(|attr| {
         let path = attr.path()?;
-        if path.syntax().text().to_string().contains("test") {
-            Some(attr)
-        } else {
-            None
-        }
+        path.syntax().text().to_string().contains("test").then(|| attr)
     })
 }
 
@@ -128,42 +121,47 @@ pub fn add_trait_assoc_items_to_impl(
     sema: &hir::Semantics<ide_db::RootDatabase>,
     items: Vec<ast::AssocItem>,
     trait_: hir::Trait,
-    impl_def: ast::Impl,
+    impl_: ast::Impl,
     target_scope: hir::SemanticsScope,
 ) -> (ast::Impl, ast::AssocItem) {
-    let impl_item_list = impl_def.assoc_item_list().unwrap_or_else(make::assoc_item_list);
-
-    let n_existing_items = impl_item_list.assoc_items().count();
     let source_scope = sema.scope_for_def(trait_);
-    let ast_transform = QualifyPaths::new(&target_scope, &source_scope)
-        .or(SubstituteTypeParams::for_trait_impl(&source_scope, trait_, impl_def.clone()));
 
-    let items = items
-        .into_iter()
-        .map(|it| ast_transform::apply(&*ast_transform, it))
-        .map(|it| match it {
-            ast::AssocItem::Fn(def) => ast::AssocItem::Fn(add_body(def)),
-            ast::AssocItem::TypeAlias(def) => ast::AssocItem::TypeAlias(def.remove_bounds()),
-            _ => it,
-        })
-        .map(|it| edit::remove_attrs_and_docs(&it));
+    let transform = PathTransform {
+        subst: (trait_, impl_.clone()),
+        source_scope: &source_scope,
+        target_scope: &target_scope,
+    };
 
-    let new_impl_item_list = impl_item_list.append_items(items);
-    let new_impl_def = impl_def.with_assoc_item_list(new_impl_item_list);
-    let first_new_item =
-        new_impl_def.assoc_item_list().unwrap().assoc_items().nth(n_existing_items).unwrap();
-    return (new_impl_def, first_new_item);
+    let items = items.into_iter().map(|assoc_item| {
+        let assoc_item = assoc_item.clone_for_update();
+        transform.apply(assoc_item.clone());
+        edit::remove_attrs_and_docs(&assoc_item).clone_subtree().clone_for_update()
+    });
 
-    fn add_body(fn_def: ast::Fn) -> ast::Fn {
-        match fn_def.body() {
-            Some(_) => fn_def,
-            None => {
-                let body =
-                    make::block_expr(None, Some(make::expr_todo())).indent(edit::IndentLevel(1));
-                fn_def.with_body(body)
+    let res = impl_.clone_for_update();
+
+    let assoc_item_list = res.get_or_create_assoc_item_list();
+    let mut first_item = None;
+    for item in items {
+        first_item.get_or_insert_with(|| item.clone());
+        match &item {
+            ast::AssocItem::Fn(fn_) if fn_.body().is_none() => {
+                let body = make::block_expr(None, Some(make::ext::expr_todo()))
+                    .indent(edit::IndentLevel(1));
+                ted::replace(fn_.get_or_create_body().syntax(), body.clone_for_update().syntax())
             }
+            ast::AssocItem::TypeAlias(type_alias) => {
+                if let Some(type_bound_list) = type_alias.type_bound_list() {
+                    type_bound_list.remove()
+                }
+            }
+            _ => {}
         }
+
+        assoc_item_list.add_item(item)
     }
+
+    (res, first_item.unwrap())
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -214,10 +212,7 @@ pub(crate) fn invert_boolean_expression(
     sema: &Semantics<RootDatabase>,
     expr: ast::Expr,
 ) -> ast::Expr {
-    if let Some(expr) = invert_special_case(sema, &expr) {
-        return expr;
-    }
-    make::expr_prefix(T![!], expr)
+    invert_special_case(sema, &expr).unwrap_or_else(|| make::expr_prefix(T![!], expr))
 }
 
 fn invert_special_case(sema: &Semantics<RootDatabase>, expr: &ast::Expr) -> Option<ast::Expr> {
@@ -262,8 +257,13 @@ fn invert_special_case(sema: &Semantics<RootDatabase>, expr: &ast::Expr) -> Opti
                 pe.expr()
             }
         }
-        // FIXME:
-        // ast::Expr::Literal(true | false )
+        ast::Expr::Literal(lit) => match lit.kind() {
+            ast::LiteralKind::Bool(b) => match b {
+                true => Some(ast::Expr::Literal(make::expr_literal("false"))),
+                false => Some(ast::Expr::Literal(make::expr_literal("true"))),
+            },
+            _ => None,
+        },
         _ => None,
     }
 }
@@ -487,7 +487,7 @@ pub(crate) fn add_method_to_adt(
     let start_offset = impl_def
         .and_then(|impl_def| find_impl_block_end(impl_def, &mut buf))
         .unwrap_or_else(|| {
-            buf = generate_impl_text(&adt, &buf);
+            buf = generate_impl_text(adt, &buf);
             adt.syntax().text_range().end()
         });
 

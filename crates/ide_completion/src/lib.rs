@@ -1,15 +1,14 @@
 //! `completions` crate provides utilities for generating completions of user input.
 
+mod completions;
 mod config;
-mod item;
 mod context;
+mod item;
 mod patterns;
-mod generated_lint_completions;
-#[cfg(test)]
-mod test_utils;
 mod render;
 
-mod completions;
+#[cfg(test)]
+mod tests;
 
 use completions::flyimport::position_for_import;
 use ide_db::{
@@ -26,7 +25,7 @@ use crate::{completions::Completions, context::CompletionContext, item::Completi
 
 pub use crate::{
     config::CompletionConfig,
-    item::{CompletionItem, CompletionItemKind, CompletionRelevance, ImportEdit, InsertTextFormat},
+    item::{CompletionItem, CompletionItemKind, CompletionRelevance, ImportEdit},
 };
 
 //FIXME: split the following feature into fine-grained features.
@@ -80,7 +79,7 @@ pub use crate::{
 //
 // And the auto import completions, enabled with the `rust-analyzer.completion.autoimport.enable` setting and the corresponding LSP client capabilities.
 // Those are the additional completion options with automatic `use` import and options from all project importable items,
-// fuzzy matched agains the completion imput.
+// fuzzy matched against the completion input.
 //
 // image::https://user-images.githubusercontent.com/48062697/113020667-b72ab880-917a-11eb-8778-716cf26a0eb3.gif[]
 
@@ -107,7 +106,7 @@ pub use crate::{
 /// identifier prefix/fuzzy match should be done higher in the stack, together
 /// with ordering of completions (currently this is done by the client).
 ///
-/// # Hypothetical Completion Problem
+/// # Speculative Completion Problem
 ///
 /// There's a curious unsolved problem in the current implementation. Often, you
 /// want to compute completions on a *slightly different* text document.
@@ -121,7 +120,7 @@ pub use crate::{
 /// doesn't allow such "phantom" inputs.
 ///
 /// Another case where this would be instrumental is macro expansion. We want to
-/// insert a fake ident and re-expand code. There's `expand_hypothetical` as a
+/// insert a fake ident and re-expand code. There's `expand_speculative` as a
 /// work-around for this.
 ///
 /// A different use-case is completion of injection (examples and links in doc
@@ -142,6 +141,7 @@ pub fn completions(
     let ctx = CompletionContext::new(db, position, config)?;
 
     if ctx.no_completion_required() {
+        cov_mark::hit!(no_completion_required);
         // No work required here.
         return None;
     }
@@ -150,7 +150,6 @@ pub fn completions(
     completions::attribute::complete_attribute(&mut acc, &ctx);
     completions::fn_param::complete_fn_param(&mut acc, &ctx);
     completions::keyword::complete_expr_keyword(&mut acc, &ctx);
-    completions::keyword::complete_use_tree_keyword(&mut acc, &ctx);
     completions::snippet::complete_expr_snippet(&mut acc, &ctx);
     completions::snippet::complete_item_snippet(&mut acc, &ctx);
     completions::qualified_path::complete_qualified_path(&mut acc, &ctx);
@@ -159,7 +158,6 @@ pub fn completions(
     completions::record::complete_record(&mut acc, &ctx);
     completions::pattern::complete_pattern(&mut acc, &ctx);
     completions::postfix::complete_postfix(&mut acc, &ctx);
-    completions::macro_in_item_position::complete_macro_in_item_position(&mut acc, &ctx);
     completions::trait_impl::complete_trait_impl(&mut acc, &ctx);
     completions::mod_::complete_mod(&mut acc, &ctx);
     completions::flyimport::import_on_the_fly(&mut acc, &ctx);
@@ -179,7 +177,7 @@ pub fn resolve_completion_edits(
 ) -> Option<Vec<TextEdit>> {
     let ctx = CompletionContext::new(db, position, config)?;
     let position_for_import = position_for_import(&ctx, None)?;
-    let scope = ImportScope::find_insert_use_container(position_for_import, &ctx.sema)?;
+    let scope = ImportScope::find_insert_use_container_with_macros(position_for_import, &ctx.sema)?;
 
     let current_module = ctx.sema.scope(position_for_import).module()?;
     let current_crate = current_module.krate();
@@ -201,118 +199,4 @@ pub fn resolve_completion_edits(
         LocatedImport::new(import_path.clone(), item_to_import, item_to_import, Some(import_path));
 
     ImportEdit { import, scope }.to_text_edit(config.insert_use).map(|edit| vec![edit])
-}
-
-#[cfg(test)]
-mod tests {
-    use crate::test_utils::{self, TEST_CONFIG};
-
-    struct DetailAndDocumentation<'a> {
-        detail: &'a str,
-        documentation: &'a str,
-    }
-
-    fn check_detail_and_documentation(ra_fixture: &str, expected: DetailAndDocumentation) {
-        let (db, position) = test_utils::position(ra_fixture);
-        let config = TEST_CONFIG;
-        let completions: Vec<_> = crate::completions(&db, &config, position).unwrap().into();
-        for item in completions {
-            if item.detail() == Some(expected.detail) {
-                let opt = item.documentation();
-                let doc = opt.as_ref().map(|it| it.as_str());
-                assert_eq!(doc, Some(expected.documentation));
-                return;
-            }
-        }
-        panic!("completion detail not found: {}", expected.detail)
-    }
-
-    fn check_no_completion(ra_fixture: &str) {
-        let (db, position) = test_utils::position(ra_fixture);
-        let config = TEST_CONFIG;
-
-        let completions: Option<Vec<String>> = crate::completions(&db, &config, position)
-            .and_then(|completions| {
-                let completions: Vec<_> = completions.into();
-                if completions.is_empty() {
-                    None
-                } else {
-                    Some(completions)
-                }
-            })
-            .map(|completions| {
-                completions.into_iter().map(|completion| format!("{:?}", completion)).collect()
-            });
-
-        // `assert_eq` instead of `assert!(completions.is_none())` to get the list of completions if test will panic.
-        assert_eq!(completions, None, "Completions were generated, but weren't expected");
-    }
-
-    #[test]
-    fn test_completion_detail_from_macro_generated_struct_fn_doc_attr() {
-        check_detail_and_documentation(
-            r#"
-macro_rules! bar {
-    () => {
-        struct Bar;
-        impl Bar {
-            #[doc = "Do the foo"]
-            fn foo(&self) {}
-        }
-    }
-}
-
-bar!();
-
-fn foo() {
-    let bar = Bar;
-    bar.fo$0;
-}
-"#,
-            DetailAndDocumentation { detail: "fn(&self)", documentation: "Do the foo" },
-        );
-    }
-
-    #[test]
-    fn test_completion_detail_from_macro_generated_struct_fn_doc_comment() {
-        check_detail_and_documentation(
-            r#"
-macro_rules! bar {
-    () => {
-        struct Bar;
-        impl Bar {
-            /// Do the foo
-            fn foo(&self) {}
-        }
-    }
-}
-
-bar!();
-
-fn foo() {
-    let bar = Bar;
-    bar.fo$0;
-}
-"#,
-            DetailAndDocumentation { detail: "fn(&self)", documentation: "Do the foo" },
-        );
-    }
-
-    #[test]
-    fn test_no_completions_required() {
-        // There must be no hint for 'in' keyword.
-        check_no_completion(r#"fn foo() { for i i$0 }"#);
-        // After 'in' keyword hints may be spawned.
-        check_detail_and_documentation(
-            r#"
-/// Do the foo
-fn foo() -> &'static str { "foo" }
-
-fn bar() {
-    for c in fo$0
-}
-"#,
-            DetailAndDocumentation { detail: "fn() -> &str", documentation: "Do the foo" },
-        );
-    }
 }

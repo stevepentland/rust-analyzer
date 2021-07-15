@@ -15,93 +15,32 @@ mod assist_context;
 #[cfg(test)]
 mod tests;
 pub mod utils;
-pub mod ast_transform;
 
 use hir::Semantics;
-use ide_db::base_db::FileRange;
-use ide_db::{label::Label, source_change::SourceChange, RootDatabase};
+use ide_db::{base_db::FileRange, RootDatabase};
 use syntax::TextRange;
 
 pub(crate) use crate::assist_context::{AssistContext, Assists};
 
 pub use assist_config::AssistConfig;
+pub use ide_db::assists::{
+    Assist, AssistId, AssistKind, AssistResolveStrategy, GroupLabel, SingleResolve,
+};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AssistKind {
-    // FIXME: does the None variant make sense? Probably not.
-    None,
-
-    QuickFix,
-    Generate,
-    Refactor,
-    RefactorExtract,
-    RefactorInline,
-    RefactorRewrite,
-}
-
-impl AssistKind {
-    pub fn contains(self, other: AssistKind) -> bool {
-        if self == other {
-            return true;
-        }
-
-        match self {
-            AssistKind::None | AssistKind::Generate => return true,
-            AssistKind::Refactor => match other {
-                AssistKind::RefactorExtract
-                | AssistKind::RefactorInline
-                | AssistKind::RefactorRewrite => return true,
-                _ => return false,
-            },
-            _ => return false,
-        }
-    }
-}
-
-/// Unique identifier of the assist, should not be shown to the user
-/// directly.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct AssistId(pub &'static str, pub AssistKind);
-
-#[derive(Clone, Debug)]
-pub struct GroupLabel(pub String);
-
-#[derive(Debug, Clone)]
-pub struct Assist {
-    pub id: AssistId,
-    /// Short description of the assist, as shown in the UI.
-    pub label: Label,
-    pub group: Option<GroupLabel>,
-    /// Target ranges are used to sort assists: the smaller the target range,
-    /// the more specific assist is, and so it should be sorted first.
-    pub target: TextRange,
-    /// Computing source change sometimes is much more costly then computing the
-    /// other fields. Additionally, the actual change is not required to show
-    /// the lightbulb UI, it only is needed when the user tries to apply an
-    /// assist. So, we compute it lazily: the API allow requesting assists with
-    /// or without source change. We could (and in fact, used to) distinguish
-    /// between resolved and unresolved assists at the type level, but this is
-    /// cumbersome, especially if you want to embed an assist into another data
-    /// structure, such as a diagnostic.
-    pub source_change: Option<SourceChange>,
-}
-
-impl Assist {
-    /// Return all the assists applicable at the given position.
-    pub fn get(
-        db: &RootDatabase,
-        config: &AssistConfig,
-        resolve: bool,
-        range: FileRange,
-    ) -> Vec<Assist> {
-        let sema = Semantics::new(db);
-        let ctx = AssistContext::new(sema, config, range);
-        let mut acc = Assists::new(&ctx, resolve);
-        handlers::all().iter().for_each(|handler| {
-            handler(&mut acc, &ctx);
-        });
-        acc.finish()
-    }
+/// Return all the assists applicable at the given position.
+pub fn assists(
+    db: &RootDatabase,
+    config: &AssistConfig,
+    resolve: AssistResolveStrategy,
+    range: FileRange,
+) -> Vec<Assist> {
+    let sema = Semantics::new(db);
+    let ctx = AssistContext::new(sema, config, range);
+    let mut acc = Assists::new(&ctx, resolve);
+    handlers::all().iter().for_each(|handler| {
+        handler(&mut acc, &ctx);
+    });
+    acc.finish()
 }
 
 mod handlers {
@@ -120,6 +59,7 @@ mod handlers {
     mod convert_comment_block;
     mod convert_iter_for_each_to_for;
     mod convert_into_to_from;
+    mod convert_tuple_struct_to_named_struct;
     mod early_return;
     mod expand_glob_import;
     mod extract_function;
@@ -140,13 +80,12 @@ mod handlers {
     mod generate_enum_projection_method;
     mod generate_from_impl_for_enum;
     mod generate_function;
-    mod generate_getter_mut;
     mod generate_getter;
     mod generate_impl;
     mod generate_new;
     mod generate_setter;
     mod infer_function_return_type;
-    mod inline_function;
+    mod inline_call;
     mod inline_local_variable;
     mod introduce_named_lifetime;
     mod invert_if;
@@ -170,7 +109,6 @@ mod handlers {
     mod replace_let_with_if_let;
     mod replace_qualified_name_with_use;
     mod replace_string_with_char;
-    mod replace_unwrap_with_match;
     mod split_import;
     mod toggle_ignore;
     mod unmerge_use;
@@ -190,6 +128,7 @@ mod handlers {
             convert_comment_block::convert_comment_block,
             convert_iter_for_each_to_for::convert_iter_for_each_to_for,
             convert_into_to_from::convert_into_to_from,
+            convert_tuple_struct_to_named_struct::convert_tuple_struct_to_named_struct,
             early_return::convert_to_guarded_return,
             expand_glob_import::expand_glob_import,
             extract_struct_from_enum_variant::extract_struct_from_enum_variant,
@@ -209,13 +148,13 @@ mod handlers {
             generate_enum_projection_method::generate_enum_try_into_method,
             generate_from_impl_for_enum::generate_from_impl_for_enum,
             generate_function::generate_function,
-            generate_getter_mut::generate_getter_mut,
             generate_getter::generate_getter,
+            generate_getter::generate_getter_mut,
             generate_impl::generate_impl,
             generate_new::generate_new,
             generate_setter::generate_setter,
             infer_function_return_type::infer_function_return_type,
-            inline_function::inline_function,
+            inline_call::inline_call,
             inline_local_variable::inline_local_variable,
             introduce_named_lifetime::introduce_named_lifetime,
             invert_if::invert_if,
@@ -242,7 +181,6 @@ mod handlers {
             replace_impl_trait_with_generic::replace_impl_trait_with_generic,
             replace_let_with_if_let::replace_let_with_if_let,
             replace_qualified_name_with_use::replace_qualified_name_with_use,
-            replace_unwrap_with_match::replace_unwrap_with_match,
             split_import::split_import,
             toggle_ignore::toggle_ignore,
             unmerge_use::unmerge_use,

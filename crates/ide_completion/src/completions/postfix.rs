@@ -2,7 +2,10 @@
 
 mod format_like;
 
-use ide_db::{helpers::SnippetCap, ty_filter::TryEnum};
+use ide_db::{
+    helpers::{FamousDefs, SnippetCap},
+    ty_filter::TryEnum,
+};
 use syntax::{
     ast::{self, AstNode, AstToken},
     SyntaxKind::{BLOCK_EXPR, EXPR_STMT},
@@ -14,7 +17,8 @@ use crate::{
     completions::postfix::format_like::add_format_like_completions,
     context::CompletionContext,
     item::{Builder, CompletionKind},
-    CompletionItem, CompletionItemKind, Completions,
+    patterns::ImmediateLocation,
+    CompletionItem, CompletionItemKind, CompletionRelevance, Completions,
 };
 
 pub(crate) fn complete_postfix(acc: &mut Completions, ctx: &CompletionContext) {
@@ -22,34 +26,34 @@ pub(crate) fn complete_postfix(acc: &mut Completions, ctx: &CompletionContext) {
         return;
     }
 
-    let dot_receiver = match &ctx.dot_receiver {
+    let (dot_receiver, receiver_is_ambiguous_float_literal) = match &ctx.completion_location {
+        Some(ImmediateLocation::MethodCall { receiver: Some(it), .. }) => (it, false),
+        Some(ImmediateLocation::FieldAccess {
+            receiver: Some(it),
+            receiver_is_ambiguous_float_literal,
+        }) => (it, *receiver_is_ambiguous_float_literal),
+        _ => return,
+    };
+
+    let receiver_text = get_receiver_text(dot_receiver, receiver_is_ambiguous_float_literal);
+
+    let receiver_ty = match ctx.sema.type_of_expr(dot_receiver) {
         Some(it) => it,
         None => return,
     };
-
-    let receiver_text =
-        get_receiver_text(dot_receiver, ctx.dot_receiver_is_ambiguous_float_literal);
-
-    let receiver_ty = match ctx.sema.type_of_expr(&dot_receiver) {
-        Some(it) => it,
-        None => return,
-    };
-
-    let ref_removed_ty =
-        std::iter::successors(Some(receiver_ty.clone()), |ty| ty.remove_ref()).last().unwrap();
 
     let cap = match ctx.config.snippet_cap {
         Some(it) => it,
         None => return,
     };
-    let try_enum = TryEnum::from_ty(&ctx.sema, &ref_removed_ty);
+    let try_enum = TryEnum::from_ty(&ctx.sema, &receiver_ty.strip_references());
     if let Some(try_enum) = &try_enum {
         match try_enum {
             TryEnum::Result => {
                 postfix_snippet(
                     ctx,
                     cap,
-                    &dot_receiver,
+                    dot_receiver,
                     "ifl",
                     "if let Ok {}",
                     &format!("if let Ok($1) = {} {{\n    $0\n}}", receiver_text),
@@ -59,7 +63,7 @@ pub(crate) fn complete_postfix(acc: &mut Completions, ctx: &CompletionContext) {
                 postfix_snippet(
                     ctx,
                     cap,
-                    &dot_receiver,
+                    dot_receiver,
                     "while",
                     "while let Ok {}",
                     &format!("while let Ok($1) = {} {{\n    $0\n}}", receiver_text),
@@ -70,7 +74,7 @@ pub(crate) fn complete_postfix(acc: &mut Completions, ctx: &CompletionContext) {
                 postfix_snippet(
                     ctx,
                     cap,
-                    &dot_receiver,
+                    dot_receiver,
                     "ifl",
                     "if let Some {}",
                     &format!("if let Some($1) = {} {{\n    $0\n}}", receiver_text),
@@ -80,7 +84,7 @@ pub(crate) fn complete_postfix(acc: &mut Completions, ctx: &CompletionContext) {
                 postfix_snippet(
                     ctx,
                     cap,
-                    &dot_receiver,
+                    dot_receiver,
                     "while",
                     "while let Some {}",
                     &format!("while let Some($1) = {} {{\n    $0\n}}", receiver_text),
@@ -92,7 +96,7 @@ pub(crate) fn complete_postfix(acc: &mut Completions, ctx: &CompletionContext) {
         postfix_snippet(
             ctx,
             cap,
-            &dot_receiver,
+            dot_receiver,
             "if",
             "if expr {}",
             &format!("if {} {{\n    $0\n}}", receiver_text),
@@ -101,22 +105,34 @@ pub(crate) fn complete_postfix(acc: &mut Completions, ctx: &CompletionContext) {
         postfix_snippet(
             ctx,
             cap,
-            &dot_receiver,
+            dot_receiver,
             "while",
             "while expr {}",
             &format!("while {} {{\n    $0\n}}", receiver_text),
         )
         .add_to(acc);
-        postfix_snippet(ctx, cap, &dot_receiver, "not", "!expr", &format!("!{}", receiver_text))
+        postfix_snippet(ctx, cap, dot_receiver, "not", "!expr", &format!("!{}", receiver_text))
             .add_to(acc);
+    } else if let Some(trait_) = FamousDefs(&ctx.sema, ctx.krate).core_iter_IntoIterator() {
+        if receiver_ty.impls_trait(ctx.db, trait_, &[]) {
+            postfix_snippet(
+                ctx,
+                cap,
+                dot_receiver,
+                "for",
+                "for ele in expr {}",
+                &format!("for ele in {} {{\n    $0\n}}", receiver_text),
+            )
+            .add_to(acc);
+        }
     }
 
-    postfix_snippet(ctx, cap, &dot_receiver, "ref", "&expr", &format!("&{}", receiver_text))
+    postfix_snippet(ctx, cap, dot_receiver, "ref", "&expr", &format!("&{}", receiver_text))
         .add_to(acc);
     postfix_snippet(
         ctx,
         cap,
-        &dot_receiver,
+        dot_receiver,
         "refm",
         "&mut expr",
         &format!("&mut {}", receiver_text),
@@ -126,8 +142,7 @@ pub(crate) fn complete_postfix(acc: &mut Completions, ctx: &CompletionContext) {
     // The rest of the postfix completions create an expression that moves an argument,
     // so it's better to consider references now to avoid breaking the compilation
     let dot_receiver = include_references(dot_receiver);
-    let receiver_text =
-        get_receiver_text(&dot_receiver, ctx.dot_receiver_is_ambiguous_float_literal);
+    let receiver_text = get_receiver_text(&dot_receiver, receiver_is_ambiguous_float_literal);
 
     match try_enum {
         Some(try_enum) => match try_enum {
@@ -299,6 +314,12 @@ fn postfix_snippet(
     };
     let mut item = CompletionItem::new(CompletionKind::Postfix, ctx.source_range(), label);
     item.detail(detail).kind(CompletionItemKind::Snippet).snippet_edit(cap, edit);
+    if ctx.original_token.text() == label {
+        let mut relevance = CompletionRelevance::default();
+        relevance.exact_postfix_snippet_match = true;
+        item.set_relevance(relevance);
+    }
+
     item
 }
 
@@ -307,12 +328,12 @@ mod tests {
     use expect_test::{expect, Expect};
 
     use crate::{
-        test_utils::{check_edit, completion_list},
+        tests::{check_edit, filtered_completion_list},
         CompletionKind,
     };
 
     fn check(ra_fixture: &str, expect: Expect) {
-        let actual = completion_list(ra_fixture, CompletionKind::Postfix);
+        let actual = filtered_completion_list(ra_fixture, CompletionKind::Postfix);
         expect.assert_eq(&actual)
     }
 
@@ -436,18 +457,15 @@ fn main() {
         check_edit(
             "ifl",
             r#"
-enum Option<T> { Some(T), None }
-
+//- minicore: option
 fn main() {
-    let bar = Option::Some(true);
+    let bar = Some(true);
     bar.$0
 }
 "#,
             r#"
-enum Option<T> { Some(T), None }
-
 fn main() {
-    let bar = Option::Some(true);
+    let bar = Some(true);
     if let Some($1) = bar {
     $0
 }
@@ -461,18 +479,15 @@ fn main() {
         check_edit(
             "match",
             r#"
-enum Result<T, E> { Ok(T), Err(E) }
-
+//- minicore: result
 fn main() {
-    let bar = Result::Ok(true);
+    let bar = Ok(true);
     bar.$0
 }
 "#,
             r#"
-enum Result<T, E> { Ok(T), Err(E) }
-
 fn main() {
-    let bar = Result::Ok(true);
+    let bar = Ok(true);
     match bar {
     Ok(${1:_}) => {$2},
     Err(${3:_}) => {$0},
@@ -515,18 +530,15 @@ fn main() {
         check_edit(
             "ifl",
             r#"
-enum Option<T> { Some(T), None }
-
+//- minicore: option
 fn main() {
-    let bar = &Option::Some(true);
+    let bar = &Some(true);
     bar.$0
 }
 "#,
             r#"
-enum Option<T> { Some(T), None }
-
 fn main() {
-    let bar = &Option::Some(true);
+    let bar = &Some(true);
     if let Some($1) = bar {
     $0
 }

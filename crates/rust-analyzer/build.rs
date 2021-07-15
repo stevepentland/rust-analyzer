@@ -1,13 +1,10 @@
-//! Just embed git-hash to `--version`
+//! Construct version in the `commit-hash date chanel` format
 
 use std::{env, path::PathBuf, process::Command};
 
 fn main() {
     set_rerun();
-
-    let rev =
-        env::var("RUST_ANALYZER_REV").ok().or_else(rev).unwrap_or_else(|| "???????".to_string());
-    println!("cargo:rustc-env=REV={}", rev)
+    println!("cargo:rustc-env=REV={}", rev())
 }
 
 fn set_rerun() {
@@ -18,29 +15,59 @@ fn set_rerun() {
     );
 
     while manifest_dir.parent().is_some() {
-        if manifest_dir.join(".git/HEAD").exists() {
-            let git_dir = manifest_dir.join(".git");
-
-            println!("cargo:rerun-if-changed={}", git_dir.join("HEAD").display());
-            // current branch ref
-            if let Ok(output) =
-                Command::new("git").args(&["rev-parse", "--symbolic-full-name", "HEAD"]).output()
-            {
-                if let Ok(ref_link) = String::from_utf8(output.stdout) {
-                    println!("cargo:rerun-if-changed={}", git_dir.join(ref_link).display());
-                }
-            }
+        let head_ref = manifest_dir.join(".git/HEAD");
+        if head_ref.exists() {
+            println!("cargo:rerun-if-changed={}", head_ref.display());
             return;
         }
 
         manifest_dir.pop();
     }
+
     println!("cargo:warning=Could not find `.git/HEAD` from manifest dir!");
 }
 
-fn rev() -> Option<String> {
-    let output =
-        Command::new("git").args(&["describe", "--tags", "--exclude", "nightly"]).output().ok()?;
-    let stdout = String::from_utf8(output.stdout).ok()?;
-    Some(stdout)
+fn rev() -> String {
+    if let Ok(rev) = env::var("RUST_ANALYZER_REV") {
+        return rev;
+    }
+
+    if let Some(commit_hash) = commit_hash() {
+        let mut buf = commit_hash;
+
+        if let Some(date) = build_date() {
+            buf.push(' ');
+            buf.push_str(&date);
+        }
+
+        let channel = env::var("RUST_ANALYZER_CHANNEL").unwrap_or_else(|_| "dev".to_string());
+        buf.push(' ');
+        buf.push_str(&channel);
+
+        return buf;
+    }
+
+    "???????".to_string()
+}
+
+fn commit_hash() -> Option<String> {
+    exec("git rev-parse --short HEAD").ok()
+}
+
+fn build_date() -> Option<String> {
+    exec("date -u +%Y-%m-%d").ok()
+}
+
+fn exec(command: &str) -> std::io::Result<String> {
+    let args = command.split_ascii_whitespace().collect::<Vec<_>>();
+    let output = Command::new(args[0]).args(&args[1..]).output()?;
+    if !output.status.success() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("command {:?} returned non-zero code", command,),
+        ));
+    }
+    let stdout = String::from_utf8(output.stdout)
+        .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?;
+    Ok(stdout.trim().to_string())
 }

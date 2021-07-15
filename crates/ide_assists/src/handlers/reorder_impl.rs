@@ -4,9 +4,8 @@ use rustc_hash::FxHashMap;
 use hir::{PathResolution, Semantics};
 use ide_db::RootDatabase;
 use syntax::{
-    algo,
     ast::{self, NameOwner},
-    AstNode,
+    ted, AstNode,
 };
 
 use crate::{AssistContext, AssistId, AssistKind, Assists};
@@ -75,13 +74,18 @@ pub(crate) fn reorder_impl(acc: &mut Assists, ctx: &AssistContext) -> Option<()>
     }
 
     let target = items.syntax().text_range();
-    acc.add(AssistId("reorder_impl", AssistKind::RefactorRewrite), "Sort methods", target, |edit| {
-        let mut rewriter = algo::SyntaxRewriter::default();
-        for (old, new) in methods.iter().zip(&sorted) {
-            rewriter.replace(old.syntax(), new.syntax());
-        }
-        edit.rewrite(rewriter);
-    })
+    acc.add(
+        AssistId("reorder_impl", AssistKind::RefactorRewrite),
+        "Sort methods",
+        target,
+        |builder| {
+            let methods = methods.into_iter().map(|fn_| builder.make_mut(fn_)).collect::<Vec<_>>();
+            methods
+                .into_iter()
+                .zip(sorted)
+                .for_each(|(old, new)| ted::replace(old.syntax(), new.clone_for_update().syntax()));
+        },
+    )
 }
 
 fn compute_method_ranks(path: &ast::Path, ctx: &AssistContext) -> Option<FxHashMap<String, usize>> {
@@ -158,7 +162,7 @@ $0impl Bar for Foo {}
     }
 
     #[test]
-    fn reorder_impl_trait_methods() {
+    fn reorder_impl_trait_functions() {
         check_assist(
             reorder_impl,
             r#"
@@ -193,6 +197,35 @@ impl Bar for Foo {
     fn d() {}
 }
         "#,
+        )
+    }
+
+    #[test]
+    fn reorder_impl_trait_methods_uneven_ident_lengths() {
+        check_assist(
+            reorder_impl,
+            r#"
+trait Bar {
+    fn foo(&mut self) {}
+    fn fooo(&mut self) {}
+}
+
+struct Foo;
+impl Bar for Foo {
+    fn fooo(&mut self) {}
+    fn foo(&mut self) {$0}
+}"#,
+            r#"
+trait Bar {
+    fn foo(&mut self) {}
+    fn fooo(&mut self) {}
+}
+
+struct Foo;
+impl Bar for Foo {
+    fn foo(&mut self) {}
+    fn fooo(&mut self) {}
+}"#,
         )
     }
 }

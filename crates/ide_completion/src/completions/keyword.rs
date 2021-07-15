@@ -1,158 +1,152 @@
 //! Completes keywords.
 
-use std::iter;
+use syntax::{SyntaxKind, T};
 
-use syntax::SyntaxKind;
-
-use crate::{CompletionContext, CompletionItem, CompletionItemKind, CompletionKind, Completions};
-
-pub(crate) fn complete_use_tree_keyword(acc: &mut Completions, ctx: &CompletionContext) {
-    // complete keyword "crate" in use stmt
-    let source_range = ctx.source_range();
-
-    if ctx.use_item_syntax.is_some() {
-        if ctx.path_qual.is_none() {
-            let mut item = CompletionItem::new(CompletionKind::Keyword, source_range, "crate::");
-            item.kind(CompletionItemKind::Keyword).insert_text("crate::");
-            item.add_to(acc);
-        }
-        let mut item = CompletionItem::new(CompletionKind::Keyword, source_range, "self");
-        item.kind(CompletionItemKind::Keyword);
-        item.add_to(acc);
-        if iter::successors(ctx.path_qual.clone(), |p| p.qualifier())
-            .all(|p| p.segment().and_then(|s| s.super_token()).is_some())
-        {
-            let mut item = CompletionItem::new(CompletionKind::Keyword, source_range, "super::");
-            item.kind(CompletionItemKind::Keyword).insert_text("super::");
-            item.add_to(acc);
-        }
-    }
-
-    // Suggest .await syntax for types that implement Future trait
-    if let Some(receiver) = &ctx.dot_receiver {
-        if let Some(ty) = ctx.sema.type_of_expr(receiver) {
-            if ty.impls_future(ctx.db) {
-                let mut item =
-                    CompletionItem::new(CompletionKind::Keyword, ctx.source_range(), "await");
-                item.kind(CompletionItemKind::Keyword).detail("expr.await").insert_text("await");
-                item.add_to(acc);
-            }
-        };
-    }
-}
+use crate::{
+    context::PathCompletionContext, patterns::ImmediateLocation, CompletionContext, CompletionItem,
+    CompletionItemKind, CompletionKind, Completions,
+};
 
 pub(crate) fn complete_expr_keyword(acc: &mut Completions, ctx: &CompletionContext) {
     if ctx.token.kind() == SyntaxKind::COMMENT {
         cov_mark::hit!(no_keyword_completion_in_comments);
         return;
     }
-    if ctx.record_lit_syntax.is_some() {
+    if matches!(ctx.completion_location, Some(ImmediateLocation::RecordExpr(_))) {
         cov_mark::hit!(no_keyword_completion_in_record_lit);
         return;
     }
-
-    let has_trait_or_impl_parent = ctx.has_impl_parent || ctx.has_trait_parent;
-    if ctx.trait_as_prev_sibling || ctx.impl_as_prev_sibling {
-        add_keyword(ctx, acc, "where", "where ");
+    if ctx.attribute_under_caret.is_some() {
+        cov_mark::hit!(no_keyword_completion_in_attr_of_expr);
         return;
     }
-    if ctx.unsafe_is_prev {
-        if ctx.has_item_list_or_source_file_parent || ctx.block_expr_parent {
-            add_keyword(ctx, acc, "fn", "fn $0() {}")
+
+    // Suggest .await syntax for types that implement Future trait
+    if let Some(receiver) = ctx.dot_receiver() {
+        if let Some(ty) = ctx.sema.type_of_expr(receiver) {
+            if ty.impls_future(ctx.db) {
+                let mut item =
+                    CompletionItem::new(CompletionKind::Keyword, ctx.source_range(), "await");
+                item.kind(CompletionItemKind::Keyword).detail("expr.await");
+                item.add_to(acc);
+            }
+        };
+    }
+
+    let mut add_keyword = |kw, snippet| add_keyword(ctx, acc, kw, snippet);
+
+    let expects_assoc_item = ctx.expects_assoc_item();
+    let has_block_expr_parent = ctx.has_block_expr_parent();
+    let expects_item = ctx.expects_item();
+
+    if ctx.has_impl_or_trait_prev_sibling() {
+        add_keyword("where", "where ");
+        if ctx.has_impl_prev_sibling() {
+            add_keyword("for", "for ");
+        }
+        return;
+    }
+    if ctx.previous_token_is(T![unsafe]) {
+        if expects_item || expects_assoc_item || has_block_expr_parent {
+            add_keyword("fn", "fn $1($2) {\n    $0\n}")
         }
 
-        if (ctx.has_item_list_or_source_file_parent) || ctx.block_expr_parent {
-            add_keyword(ctx, acc, "trait", "trait $0 {}");
-            add_keyword(ctx, acc, "impl", "impl $0 {}");
+        if expects_item || has_block_expr_parent {
+            add_keyword("trait", "trait $1 {\n    $0\n}");
+            add_keyword("impl", "impl $1 {\n    $0\n}");
         }
 
         return;
     }
-    if ctx.has_item_list_or_source_file_parent || has_trait_or_impl_parent || ctx.block_expr_parent
+
+    if !ctx.has_visibility_prev_sibling()
+        && (expects_item || ctx.expects_non_trait_assoc_item() || ctx.expect_field())
     {
-        add_keyword(ctx, acc, "fn", "fn $0() {}");
-    }
-    if (ctx.has_item_list_or_source_file_parent) || ctx.block_expr_parent {
-        add_keyword(ctx, acc, "use", "use ");
-        add_keyword(ctx, acc, "impl", "impl $0 {}");
-        add_keyword(ctx, acc, "trait", "trait $0 {}");
+        add_keyword("pub(crate)", "pub(crate) ");
+        add_keyword("pub", "pub ");
     }
 
-    if ctx.has_item_list_or_source_file_parent {
-        add_keyword(ctx, acc, "enum", "enum $0 {}");
-        add_keyword(ctx, acc, "struct", "struct $0");
-        add_keyword(ctx, acc, "union", "union $0 {}");
+    if expects_item || expects_assoc_item || has_block_expr_parent {
+        add_keyword("unsafe", "unsafe ");
+        add_keyword("fn", "fn $1($2) {\n    $0\n}");
+        add_keyword("const", "const $0");
+        add_keyword("type", "type $0");
     }
 
-    if ctx.is_expr {
-        add_keyword(ctx, acc, "match", "match $0 {}");
-        add_keyword(ctx, acc, "while", "while $0 {}");
-        add_keyword(ctx, acc, "while let", "while let $1 = $0 {}");
-        add_keyword(ctx, acc, "loop", "loop {$0}");
-        add_keyword(ctx, acc, "if", "if $0 {}");
-        add_keyword(ctx, acc, "if let", "if let $1 = $0 {}");
-        add_keyword(ctx, acc, "for", "for $1 in $0 {}");
+    if expects_item || has_block_expr_parent {
+        if !ctx.has_visibility_prev_sibling() {
+            add_keyword("impl", "impl $1 {\n    $0\n}");
+            add_keyword("extern", "extern $0");
+        }
+        add_keyword("use", "use $0");
+        add_keyword("trait", "trait $1 {\n    $0\n}");
+        add_keyword("static", "static $0");
+        add_keyword("mod", "mod $0");
     }
 
-    if ctx.if_is_prev || ctx.block_expr_parent {
-        add_keyword(ctx, acc, "let", "let ");
+    if expects_item {
+        add_keyword("enum", "enum $1 {\n    $0\n}");
+        add_keyword("struct", "struct $0");
+        add_keyword("union", "union $1 {\n    $0\n}");
     }
 
-    if ctx.after_if {
-        add_keyword(ctx, acc, "else", "else {$0}");
-        add_keyword(ctx, acc, "else if", "else if $0 {}");
+    if ctx.expects_type() {
+        return;
     }
-    if (ctx.has_item_list_or_source_file_parent) || ctx.block_expr_parent {
-        add_keyword(ctx, acc, "mod", "mod $0");
+
+    if ctx.expects_expression() {
+        if !has_block_expr_parent {
+            add_keyword("unsafe", "unsafe {\n    $0\n}");
+        }
+        add_keyword("match", "match $1 {\n    $0\n}");
+        add_keyword("while", "while $1 {\n    $0\n}");
+        add_keyword("while let", "while let $1 = $2 {\n    $0\n}");
+        add_keyword("loop", "loop {\n    $0\n}");
+        add_keyword("if", "if $1 {\n    $0\n}");
+        add_keyword("if let", "if let $1 = $2 {\n    $0\n}");
+        add_keyword("for", "for $1 in $2 {\n    $0\n}");
+        add_keyword("true", "true");
+        add_keyword("false", "false");
     }
-    if ctx.bind_pat_parent || ctx.ref_pat_parent {
-        add_keyword(ctx, acc, "mut", "mut ");
+
+    if ctx.previous_token_is(T![if]) || ctx.previous_token_is(T![while]) || has_block_expr_parent {
+        add_keyword("let", "let ");
     }
-    if ctx.has_item_list_or_source_file_parent || has_trait_or_impl_parent || ctx.block_expr_parent
-    {
-        add_keyword(ctx, acc, "const", "const ");
-        add_keyword(ctx, acc, "type", "type ");
+
+    if ctx.after_if() {
+        add_keyword("else", "else {\n    $0\n}");
+        add_keyword("else if", "else if $1 {\n    $0\n}");
     }
-    if (ctx.has_item_list_or_source_file_parent) || ctx.block_expr_parent {
-        add_keyword(ctx, acc, "static", "static ");
+
+    if ctx.expects_ident_pat_or_ref_expr() {
+        add_keyword("mut", "mut ");
+    }
+
+    let (can_be_stmt, in_loop_body) = match ctx.path_context {
+        Some(PathCompletionContext {
+            is_trivial_path: true, can_be_stmt, in_loop_body, ..
+        }) => (can_be_stmt, in_loop_body),
+        _ => return,
     };
-    if (ctx.has_item_list_or_source_file_parent) || ctx.block_expr_parent {
-        add_keyword(ctx, acc, "extern", "extern ");
-    }
-    if ctx.has_item_list_or_source_file_parent
-        || has_trait_or_impl_parent
-        || ctx.block_expr_parent
-        || ctx.is_match_arm
-    {
-        add_keyword(ctx, acc, "unsafe", "unsafe ");
-    }
-    if ctx.in_loop_body {
-        if ctx.can_be_stmt {
-            add_keyword(ctx, acc, "continue", "continue;");
-            add_keyword(ctx, acc, "break", "break;");
+
+    if in_loop_body {
+        if can_be_stmt {
+            add_keyword("continue", "continue;");
+            add_keyword("break", "break;");
         } else {
-            add_keyword(ctx, acc, "continue", "continue");
-            add_keyword(ctx, acc, "break", "break");
+            add_keyword("continue", "continue");
+            add_keyword("break", "break");
         }
     }
-    if ctx.has_item_list_or_source_file_parent || ctx.has_impl_parent | ctx.has_field_list_parent {
-        add_keyword(ctx, acc, "pub(crate)", "pub(crate) ");
-        add_keyword(ctx, acc, "pub", "pub ");
-    }
 
-    if !ctx.is_trivial_path {
-        return;
-    }
-    let fn_def = match &ctx.function_syntax {
+    let fn_def = match &ctx.function_def {
         Some(it) => it,
         None => return,
     };
 
     add_keyword(
-        ctx,
-        acc,
         "return",
-        match (ctx.can_be_stmt, fn_def.ret_type().is_some()) {
+        match (can_be_stmt, fn_def.ret_type().is_some()) {
             (true, true) => "return $0;",
             (true, false) => "return;",
             (false, true) => "return $0",
@@ -167,15 +161,12 @@ fn add_keyword(ctx: &CompletionContext, acc: &mut Completions, kw: &str, snippet
 
     match ctx.config.snippet_cap {
         Some(cap) => {
-            let tmp;
-            let snippet = if snippet.ends_with('}') && ctx.incomplete_let {
+            if snippet.ends_with('}') && ctx.incomplete_let {
                 cov_mark::hit!(let_semi);
-                tmp = format!("{};", snippet);
-                &tmp
+                item.insert_snippet(cap, format!("{};", snippet));
             } else {
-                snippet
-            };
-            item.insert_snippet(cap, snippet);
+                item.insert_snippet(cap, snippet);
+            }
         }
         None => {
             item.insert_text(if snippet.contains('$') { kw } else { snippet });
@@ -189,72 +180,13 @@ mod tests {
     use expect_test::{expect, Expect};
 
     use crate::{
-        test_utils::{check_edit, completion_list},
+        tests::{check_edit, filtered_completion_list},
         CompletionKind,
     };
 
     fn check(ra_fixture: &str, expect: Expect) {
-        let actual = completion_list(ra_fixture, CompletionKind::Keyword);
+        let actual = filtered_completion_list(ra_fixture, CompletionKind::Keyword);
         expect.assert_eq(&actual)
-    }
-
-    #[test]
-    fn test_keywords_in_use_stmt() {
-        check(
-            r"use $0",
-            expect![[r#"
-                kw crate::
-                kw self
-                kw super::
-            "#]],
-        );
-
-        // FIXME: `self` shouldn't be shown here and the check below
-        check(
-            r"use a::$0",
-            expect![[r#"
-            kw self
-        "#]],
-        );
-
-        check(
-            r"use super::$0",
-            expect![[r#"
-                kw self
-                kw super::
-            "#]],
-        );
-
-        check(
-            r"use a::{b, $0}",
-            expect![[r#"
-            kw self
-        "#]],
-        );
-    }
-
-    #[test]
-    fn test_keywords_at_source_file_level() {
-        check(
-            r"m$0",
-            expect![[r#"
-                kw fn
-                kw use
-                kw impl
-                kw trait
-                kw enum
-                kw struct
-                kw union
-                kw mod
-                kw const
-                kw type
-                kw static
-                kw extern
-                kw unsafe
-                kw pub(crate)
-                kw pub
-            "#]],
-        );
     }
 
     #[test]
@@ -262,10 +194,16 @@ mod tests {
         check(
             r"fn quux() { $0 }",
             expect![[r#"
+                kw unsafe
                 kw fn
-                kw use
+                kw const
+                kw type
                 kw impl
+                kw extern
+                kw use
                 kw trait
+                kw static
+                kw mod
                 kw match
                 kw while
                 kw while let
@@ -273,14 +211,13 @@ mod tests {
                 kw if
                 kw if let
                 kw for
+                kw true
+                kw false
                 kw let
-                kw mod
-                kw const
-                kw type
-                kw static
-                kw extern
-                kw unsafe
                 kw return
+                kw self
+                kw super
+                kw crate
             "#]],
         );
     }
@@ -290,10 +227,16 @@ mod tests {
         check(
             r"fn quux() { if true { $0 } }",
             expect![[r#"
+                kw unsafe
                 kw fn
-                kw use
+                kw const
+                kw type
                 kw impl
+                kw extern
+                kw use
                 kw trait
+                kw static
+                kw mod
                 kw match
                 kw while
                 kw while let
@@ -301,14 +244,13 @@ mod tests {
                 kw if
                 kw if let
                 kw for
+                kw true
+                kw false
                 kw let
-                kw mod
-                kw const
-                kw type
-                kw static
-                kw extern
-                kw unsafe
                 kw return
+                kw self
+                kw super
+                kw crate
             "#]],
         );
     }
@@ -318,10 +260,16 @@ mod tests {
         check(
             r#"fn quux() { if true { () } $0 }"#,
             expect![[r#"
+                kw unsafe
                 kw fn
-                kw use
+                kw const
+                kw type
                 kw impl
+                kw extern
+                kw use
                 kw trait
+                kw static
+                kw mod
                 kw match
                 kw while
                 kw while let
@@ -329,22 +277,23 @@ mod tests {
                 kw if
                 kw if let
                 kw for
+                kw true
+                kw false
                 kw let
                 kw else
                 kw else if
-                kw mod
-                kw const
-                kw type
-                kw static
-                kw extern
-                kw unsafe
                 kw return
+                kw self
+                kw super
+                kw crate
             "#]],
         );
         check_edit(
             "else",
             r#"fn quux() { if true { () } $0 }"#,
-            r#"fn quux() { if true { () } else {$0} }"#,
+            r#"fn quux() { if true { () } else {
+    $0
+} }"#,
         );
     }
 
@@ -357,6 +306,7 @@ fn quux() -> i32 {
 }
 "#,
             expect![[r#"
+                kw unsafe
                 kw match
                 kw while
                 kw while let
@@ -364,36 +314,12 @@ fn quux() -> i32 {
                 kw if
                 kw if let
                 kw for
-                kw unsafe
+                kw true
+                kw false
                 kw return
-            "#]],
-        );
-    }
-
-    #[test]
-    fn test_keywords_in_trait_def() {
-        check(
-            r"trait My { $0 }",
-            expect![[r#"
-                kw fn
-                kw const
-                kw type
-                kw unsafe
-            "#]],
-        );
-    }
-
-    #[test]
-    fn test_keywords_in_impl_def() {
-        check(
-            r"impl My { $0 }",
-            expect![[r#"
-                kw fn
-                kw const
-                kw type
-                kw unsafe
-                kw pub(crate)
-                kw pub
+                kw self
+                kw super
+                kw crate
             "#]],
         );
     }
@@ -403,10 +329,16 @@ fn quux() -> i32 {
         check(
             r"fn my() { loop { $0 } }",
             expect![[r#"
+                kw unsafe
                 kw fn
-                kw use
+                kw const
+                kw type
                 kw impl
+                kw extern
+                kw use
                 kw trait
+                kw static
+                kw mod
                 kw match
                 kw while
                 kw while let
@@ -414,28 +346,15 @@ fn quux() -> i32 {
                 kw if
                 kw if let
                 kw for
+                kw true
+                kw false
                 kw let
-                kw mod
-                kw const
-                kw type
-                kw static
-                kw extern
-                kw unsafe
                 kw continue
                 kw break
                 kw return
-            "#]],
-        );
-    }
-
-    #[test]
-    fn test_keywords_after_unsafe_in_item_list() {
-        check(
-            r"unsafe $0",
-            expect![[r#"
-                kw fn
-                kw trait
-                kw impl
+                kw self
+                kw super
+                kw crate
             "#]],
         );
     }
@@ -448,44 +367,6 @@ fn quux() -> i32 {
                 kw fn
                 kw trait
                 kw impl
-            "#]],
-        );
-    }
-
-    #[test]
-    fn test_mut_in_ref_and_in_fn_parameters_list() {
-        check(
-            r"fn my_fn(&$0) {}",
-            expect![[r#"
-                kw mut
-            "#]],
-        );
-        check(
-            r"fn my_fn($0) {}",
-            expect![[r#"
-                kw mut
-            "#]],
-        );
-        check(
-            r"fn my_fn() { let &$0 }",
-            expect![[r#"
-                kw mut
-            "#]],
-        );
-    }
-
-    #[test]
-    fn test_where_keyword() {
-        check(
-            r"trait A $0",
-            expect![[r#"
-                kw where
-            "#]],
-        );
-        check(
-            r"impl A $0",
-            expect![[r#"
-                kw where
             "#]],
         );
     }
@@ -522,17 +403,11 @@ Some multi-line comment$0
     fn test_completion_await_impls_future() {
         check(
             r#"
-//- /main.rs crate:main deps:std
-use std::future::*;
+//- minicore: future
+use core::future::*;
 struct A {}
 impl Future for A {}
 fn foo(a: A) { a.$0 }
-
-//- /std/lib.rs crate:std
-pub mod future {
-    #[lang = "future_trait"]
-    pub trait Future {}
-}
 "#,
             expect![[r#"
                 kw await expr.await
@@ -541,19 +416,11 @@ pub mod future {
 
         check(
             r#"
-//- /main.rs crate:main deps:std
+//- minicore: future
 use std::future::*;
 fn foo() {
     let a = async {};
     a.$0
-}
-
-//- /std/lib.rs crate:std
-pub mod future {
-    #[lang = "future_trait"]
-    pub trait Future {
-        type Output;
-    }
 }
 "#,
             expect![[r#"
@@ -567,6 +434,7 @@ pub mod future {
         check(
             r#"fn main() { let _ = $0 }"#,
             expect![[r#"
+                kw unsafe
                 kw match
                 kw while
                 kw while let
@@ -574,23 +442,12 @@ pub mod future {
                 kw if
                 kw if let
                 kw for
+                kw true
+                kw false
                 kw return
-            "#]],
-        )
-    }
-
-    #[test]
-    fn before_field() {
-        check(
-            r#"
-struct Foo {
-    $0
-    pub f: i32,
-}
-"#,
-            expect![[r#"
-                kw pub(crate)
-                kw pub
+                kw self
+                kw super
+                kw crate
             "#]],
         )
     }
@@ -627,6 +484,7 @@ fn foo() {
 }
 "#,
             expect![[r#"
+                kw unsafe
                 kw match
                 kw while
                 kw while let
@@ -634,7 +492,12 @@ fn foo() {
                 kw if
                 kw if let
                 kw for
+                kw true
+                kw false
                 kw return
+                kw self
+                kw super
+                kw crate
             "#]],
         );
     }
@@ -648,7 +511,9 @@ fn foo() {
 fn main() { let x = $0 }
 "#,
             r#"
-fn main() { let x = match $0 {}; }
+fn main() { let x = match $1 {
+    $0
+}; }
 "#,
         );
 
@@ -662,7 +527,9 @@ fn main() {
 "#,
             r#"
 fn main() {
-    let x = if $0 {};
+    let x = if $1 {
+    $0
+};
     let y = 92;
 }
 "#,
@@ -678,7 +545,9 @@ fn main() {
 "#,
             r#"
 fn main() {
-    let x = loop {$0};
+    let x = loop {
+    $0
+};
     bar();
 }
 "#,

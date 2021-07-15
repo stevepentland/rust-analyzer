@@ -7,7 +7,7 @@ use std::{mem, ops::RangeInclusive};
 use parser::T;
 
 use crate::{
-    ast::{edit::IndentLevel, make},
+    ast::{self, edit::IndentLevel, make, AstNode},
     SyntaxElement, SyntaxKind, SyntaxNode, SyntaxToken,
 };
 
@@ -125,8 +125,11 @@ pub fn remove_all_iter(range: impl IntoIterator<Item = SyntaxElement>) {
 }
 
 pub fn replace(old: impl Element, new: impl Element) {
+    replace_with_many(old, vec![new.syntax_element()])
+}
+pub fn replace_with_many(old: impl Element, new: Vec<SyntaxElement>) {
     let old = old.syntax_element();
-    replace_all(old.clone()..=old, vec![new.syntax_element()])
+    replace_all(old.clone()..=old, new)
 }
 pub fn replace_all(range: RangeInclusive<SyntaxElement>, new: Vec<SyntaxElement>) {
     let start = range.start().index();
@@ -149,6 +152,23 @@ fn ws_before(position: &Position, new: &SyntaxElement) -> Option<SyntaxToken> {
         PositionRepr::FirstChild(_) => return None,
         PositionRepr::After(it) => it,
     };
+
+    if prev.kind() == T!['{'] && new.kind() == SyntaxKind::USE {
+        if let Some(item_list) = prev.parent().and_then(ast::ItemList::cast) {
+            let mut indent = IndentLevel::from_element(&item_list.syntax().clone().into());
+            indent.0 += 1;
+            return Some(make::tokens::whitespace(&format!("\n{}", indent)));
+        }
+    }
+
+    if prev.kind() == T!['{'] && ast::Stmt::can_cast(new.kind()) {
+        if let Some(block_expr) = prev.parent().and_then(ast::BlockExpr::cast) {
+            let mut indent = IndentLevel::from_element(&block_expr.syntax().clone().into());
+            indent.0 += 1;
+            return Some(make::tokens::whitespace(&format!("\n{}", indent)));
+        }
+    }
+
     ws_between(prev, new)
 }
 fn ws_after(position: &Position, new: &SyntaxElement) -> Option<SyntaxToken> {
@@ -171,9 +191,15 @@ fn ws_between(left: &SyntaxElement, right: &SyntaxElement) -> Option<SyntaxToken
     if left.kind() == T![&] && right.kind() == SyntaxKind::LIFETIME {
         return None;
     }
+    if right.kind() == SyntaxKind::GENERIC_ARG_LIST {
+        return None;
+    }
 
     if right.kind() == SyntaxKind::USE {
-        let indent = IndentLevel::from_element(left);
+        let mut indent = IndentLevel::from_element(left);
+        if left.kind() == SyntaxKind::USE {
+            indent.0 = IndentLevel::from_element(right).0.max(indent.0);
+        }
         return Some(make::tokens::whitespace(&format!("\n{}", indent)));
     }
     Some(make::tokens::single_space())

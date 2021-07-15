@@ -1,6 +1,6 @@
 use hir::HirDisplay;
 use syntax::{
-    ast::{self, AstNode, LetStmt, NameOwner},
+    ast::{self, AstNode, LetStmt},
     TextRange,
 };
 
@@ -31,9 +31,6 @@ pub(crate) fn add_explicit_type(acc: &mut Assists, ctx: &AssistContext) -> Optio
         _ => return None,
     };
     let pat_range = pat.syntax().text_range();
-    // The binding must have a name
-    let name = pat.name()?;
-    let name_range = name.syntax().text_range();
 
     // Assist should only be applicable if cursor is between 'let' and '='
     let cursor_in_range = {
@@ -58,7 +55,7 @@ pub(crate) fn add_explicit_type(acc: &mut Assists, ctx: &AssistContext) -> Optio
     }
 
     // Infer type
-    let ty = ctx.sema.type_of_expr(&expr)?;
+    let (ty, _) = ctx.sema.type_of_expr_with_coercion(&expr)?;
     if ty.contains_unknown() || ty.is_closure() {
         cov_mark::hit!(add_explicit_type_not_applicable_if_ty_not_inferred);
         return None;
@@ -74,7 +71,7 @@ pub(crate) fn add_explicit_type(acc: &mut Assists, ctx: &AssistContext) -> Optio
                 builder.replace(ascribed_ty.syntax().text_range(), inferred_type);
             }
             None => {
-                builder.insert(name_range.end(), format!(": {}", inferred_type));
+                builder.insert(pat_range.end(), format!(": {}", inferred_type));
             }
         },
     )
@@ -198,6 +195,34 @@ fn main() {
         )
     }
 
+    /// https://github.com/rust-analyzer/rust-analyzer/issues/2922
+    #[test]
+    fn regression_issue_2922() {
+        check_assist(
+            add_explicit_type,
+            r#"
+fn main() {
+    let $0v = [0.0; 2];
+}
+"#,
+            r#"
+fn main() {
+    let v: [f64; 2] = [0.0; 2];
+}
+"#,
+        );
+        // note: this may break later if we add more consteval. it just needs to be something that our
+        // consteval engine doesn't understand
+        check_assist_not_applicable(
+            add_explicit_type,
+            r#"
+fn main() {
+    let $0l = [0.0; 2+2];
+}
+"#,
+        );
+    }
+
     #[test]
     fn default_generics_should_not_be_added() {
         check_assist(
@@ -214,6 +239,42 @@ struct Test<K, T = u8> { k: K, t: T }
 
 fn main() {
     let test: Test<i32> = Test { t: 23u8, k: 33 };
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn type_should_be_added_after_pattern() {
+        // LetStmt = Attr* 'let' Pat (':' Type)? '=' initializer:Expr ';'
+        check_assist(
+            add_explicit_type,
+            r#"
+fn main() {
+    let $0test @ () = ();
+}
+"#,
+            r#"
+fn main() {
+    let test @ (): () = ();
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn add_explicit_type_inserts_coercions() {
+        check_assist(
+            add_explicit_type,
+            r#"
+//- minicore: coerce_unsized
+fn f() {
+    let $0x: *const [_] = &[3];
+}
+"#,
+            r#"
+fn f() {
+    let x: *const [i32] = &[3];
 }
 "#,
         );

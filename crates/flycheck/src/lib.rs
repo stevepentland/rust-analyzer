@@ -67,7 +67,10 @@ impl FlycheckHandle {
     ) -> FlycheckHandle {
         let actor = FlycheckActor::new(id, sender, config, workspace_root);
         let (sender, receiver) = unbounded::<Restart>();
-        let thread = jod_thread::spawn(move || actor.run(receiver));
+        let thread = jod_thread::Builder::new()
+            .name("Flycheck".to_owned())
+            .spawn(move || actor.run(receiver))
+            .expect("failed to spawn thread");
         FlycheckHandle { sender, thread }
     }
 
@@ -215,6 +218,7 @@ impl FlycheckActor {
             } => {
                 let mut cmd = Command::new(toolchain::cargo());
                 cmd.arg(command);
+                cmd.current_dir(&self.workspace_root);
                 cmd.args(&["--workspace", "--message-format=json", "--manifest-path"])
                     .arg(self.workspace_root.join("Cargo.toml"));
 
@@ -265,7 +269,10 @@ impl CargoHandle {
         let child_stdout = child.stdout.take().unwrap();
         let (sender, receiver) = unbounded();
         let actor = CargoActor::new(child_stdout, sender);
-        let thread = jod_thread::spawn(move || actor.run());
+        let thread = jod_thread::Builder::new()
+            .name("CargoHandle".to_owned())
+            .spawn(move || actor.run())
+            .expect("failed to spawn thread");
         CargoHandle { child, thread, receiver }
     }
     fn join(mut self) -> io::Result<()> {

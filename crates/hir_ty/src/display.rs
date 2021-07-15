@@ -2,10 +2,7 @@
 //! HIR back into source code, and just displaying them for debugging/testing
 //! purposes.
 
-use std::{
-    array,
-    fmt::{self, Debug},
-};
+use std::fmt::{self, Debug};
 
 use chalk_ir::BoundVar;
 use hir_def::{
@@ -13,6 +10,7 @@ use hir_def::{
     db::DefDatabase,
     find_path,
     generics::TypeParamProvenance,
+    intern::{Internable, Interned},
     item_scope::ItemInNs,
     path::{Path, PathKind},
     type_ref::{TypeBound, TypeRef},
@@ -20,14 +18,19 @@ use hir_def::{
     AssocContainerId, Lookup, ModuleId, TraitId,
 };
 use hir_expand::{hygiene::Hygiene, name::Name};
+use itertools::Itertools;
 
 use crate::{
-    const_from_placeholder_idx, db::HirDatabase, from_assoc_type_id, from_foreign_def_id,
-    from_placeholder_idx, lt_from_placeholder_idx, mapping::from_chalk, primitive, subst_prefix,
-    to_assoc_type_id, utils::generics, AdtId, AliasEq, AliasTy, CallableDefId, CallableSig, Const,
-    ConstValue, DomainGoal, GenericArg, ImplTraitId, Interner, Lifetime, LifetimeData,
-    LifetimeOutlives, Mutability, OpaqueTy, ProjectionTy, ProjectionTyExt, QuantifiedWhereClause,
-    Scalar, TraitRef, TraitRefExt, Ty, TyExt, TyKind, WhereClause,
+    const_from_placeholder_idx,
+    db::HirDatabase,
+    from_assoc_type_id, from_foreign_def_id, from_placeholder_idx, lt_from_placeholder_idx,
+    mapping::from_chalk,
+    primitive, subst_prefix, to_assoc_type_id,
+    utils::{self, generics},
+    AdtId, AliasEq, AliasTy, CallableDefId, CallableSig, Const, ConstValue, DomainGoal, GenericArg,
+    ImplTraitId, Interner, Lifetime, LifetimeData, LifetimeOutlives, Mutability, OpaqueTy,
+    ProjectionTy, ProjectionTyExt, QuantifiedWhereClause, Scalar, TraitRef, TraitRefExt, Ty, TyExt,
+    TyKind, WhereClause,
 };
 
 pub struct HirFormatter<'a> {
@@ -256,6 +259,12 @@ impl<T: HirDisplay> HirDisplay for &'_ T {
     }
 }
 
+impl<T: HirDisplay + Internable> HirDisplay for Interned<T> {
+    fn hir_fmt(&self, f: &mut HirFormatter) -> Result<(), HirDisplayError> {
+        HirDisplay::hir_fmt(self.as_ref(), f)
+    }
+}
+
 impl HirDisplay for ProjectionTy {
     fn hir_fmt(&self, f: &mut HirFormatter) -> Result<(), HirDisplayError> {
         if f.should_truncate() {
@@ -308,7 +317,7 @@ impl HirDisplay for Const {
                 let param_data = &generics.params.consts[id.local_id];
                 write!(f, "{}", param_data.name)
             }
-            ConstValue::Concrete(_) => write!(f, "_"),
+            ConstValue::Concrete(c) => write!(f, "{}", c.interned),
         }
     }
 }
@@ -375,7 +384,8 @@ impl HirDisplay for Ty {
                     &TyKind::Alias(AliasTy::Opaque(OpaqueTy {
                         opaque_ty_id,
                         substitution: ref parameters,
-                    })) => {
+                    }))
+                    | &TyKind::OpaqueType(opaque_ty_id, ref parameters) => {
                         let impl_trait_id = f.db.lookup_intern_impl_trait_id(opaque_ty_id.into());
                         if let ImplTraitId::ReturnTypeImplTrait(func, idx) = impl_trait_id {
                             datas =
@@ -699,12 +709,7 @@ impl HirDisplay for CallableSig {
 
 fn fn_traits(db: &dyn DefDatabase, trait_: TraitId) -> impl Iterator<Item = TraitId> {
     let krate = trait_.lookup(db).container.krate();
-    let fn_traits = [
-        db.lang_item(krate, "fn".into()),
-        db.lang_item(krate, "fn_mut".into()),
-        db.lang_item(krate, "fn_once".into()),
-    ];
-    array::IntoIter::new(fn_traits).into_iter().flatten().flat_map(|it| it.as_trait())
+    utils::fn_traits(db, krate)
 }
 
 pub fn write_bounds_like_dyn_trait_with_prefix(
@@ -771,8 +776,10 @@ fn write_bounds_like_dyn_trait(
             }
             WhereClause::AliasEq(alias_eq) if is_fn_trait => {
                 is_fn_trait = false;
-                write!(f, " -> ")?;
-                alias_eq.ty.hir_fmt(f)?;
+                if !alias_eq.ty.is_unit() {
+                    write!(f, " -> ")?;
+                    alias_eq.ty.hir_fmt(f)?;
+                }
             }
             WhereClause::AliasEq(AliasEq { ty, alias }) => {
                 // in types in actual Rust, these will always come
@@ -962,11 +969,10 @@ impl HirDisplay for TypeRef {
                 write!(f, "{}", mutability)?;
                 inner.hir_fmt(f)?;
             }
-            TypeRef::Array(inner) => {
+            TypeRef::Array(inner, len) => {
                 write!(f, "[")?;
                 inner.hir_fmt(f)?;
-                // FIXME: Array length?
-                write!(f, "; _]")?;
+                write!(f, "; {}]", len)?;
             }
             TypeRef::Slice(inner) => {
                 write!(f, "[")?;
@@ -1000,7 +1006,7 @@ impl HirDisplay for TypeRef {
             }
             TypeRef::Macro(macro_call) => {
                 let macro_call = macro_call.to_node(f.db.upcast());
-                let ctx = body::LowerCtx::with_hygiene(&Hygiene::new_unhygienic());
+                let ctx = body::LowerCtx::with_hygiene(f.db.upcast(), &Hygiene::new_unhygienic());
                 match macro_call.path() {
                     Some(path) => match Path::from_src(path, &ctx) {
                         Some(path) => path.hir_fmt(f)?,
@@ -1021,6 +1027,10 @@ impl HirDisplay for TypeBound {
         match self {
             TypeBound::Path(path) => path.hir_fmt(f),
             TypeBound::Lifetime(lifetime) => write!(f, "{}", lifetime.name),
+            TypeBound::ForLifetime(lifetimes, path) => {
+                write!(f, "for<{}> ", lifetimes.iter().format(", "))?;
+                path.hir_fmt(f)
+            }
             TypeBound::Error => write!(f, "{{error}}"),
         }
     }

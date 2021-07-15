@@ -28,7 +28,7 @@ pub(crate) fn reorder_fields(acc: &mut Assists, ctx: &AssistContext) -> Option<(
         .or_else(|| ctx.find_node_at_offset::<ast::RecordPat>().map(Either::Right))?;
 
     let path = record.as_ref().either(|it| it.path(), |it| it.path())?;
-    let ranks = compute_fields_ranks(&path, &ctx)?;
+    let ranks = compute_fields_ranks(&path, ctx)?;
     let get_rank_of_field =
         |of: Option<_>| *ranks.get(&of.unwrap_or_default()).unwrap_or(&usize::MAX);
 
@@ -70,10 +70,10 @@ pub(crate) fn reorder_fields(acc: &mut Assists, ctx: &AssistContext) -> Option<(
         target,
         |builder| match fields {
             Either::Left((sorted, field_list)) => {
-                replace(builder.make_ast_mut(field_list).fields(), sorted)
+                replace(builder.make_mut(field_list).fields(), sorted)
             }
             Either::Right((sorted, field_list)) => {
-                replace(builder.make_ast_mut(field_list).fields(), sorted)
+                replace(builder.make_mut(field_list).fields(), sorted)
             }
         },
     )
@@ -83,11 +83,9 @@ fn replace<T: AstNode + PartialEq>(
     fields: impl Iterator<Item = T>,
     sorted_fields: impl IntoIterator<Item = T>,
 ) {
-    fields.zip(sorted_fields).filter(|(field, sorted)| field != sorted).for_each(
-        |(field, sorted_field)| {
-            ted::replace(field.syntax(), sorted_field.syntax().clone_for_update());
-        },
-    );
+    fields.zip(sorted_fields).for_each(|(field, sorted_field)| {
+        ted::replace(field.syntax(), sorted_field.syntax().clone_for_update())
+    });
 }
 
 fn compute_fields_ranks(path: &ast::Path, ctx: &AssistContext) -> Option<FxHashMap<String, usize>> {

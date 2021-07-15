@@ -1,8 +1,10 @@
 //! Various extensions traits for Chalk types.
 
-use chalk_ir::Mutability;
+use chalk_ir::{FloatTy, IntTy, Mutability, Scalar, UintTy};
 use hir_def::{
-    type_ref::Rawness, AssocContainerId, FunctionId, GenericDefId, HasModule, Lookup, TraitId,
+    builtin_type::{BuiltinFloat, BuiltinInt, BuiltinType, BuiltinUint},
+    type_ref::Rawness,
+    AssocContainerId, FunctionId, GenericDefId, HasModule, Lookup, TraitId,
 };
 
 use crate::{
@@ -16,8 +18,10 @@ pub trait TyExt {
     fn is_unit(&self) -> bool;
     fn is_never(&self) -> bool;
     fn is_unknown(&self) -> bool;
+    fn is_ty_var(&self) -> bool;
 
     fn as_adt(&self) -> Option<(hir_def::AdtId, &Substitution)>;
+    fn as_builtin(&self) -> Option<BuiltinType>;
     fn as_tuple(&self) -> Option<&Substitution>;
     fn as_fn_def(&self, db: &dyn HirDatabase) -> Option<FunctionId>;
     fn as_reference(&self) -> Option<(&Ty, Lifetime, Mutability)>;
@@ -52,9 +56,42 @@ impl TyExt for Ty {
         matches!(self.kind(&Interner), TyKind::Error)
     }
 
+    fn is_ty_var(&self) -> bool {
+        matches!(self.kind(&Interner), TyKind::InferenceVar(_, _))
+    }
+
     fn as_adt(&self) -> Option<(hir_def::AdtId, &Substitution)> {
         match self.kind(&Interner) {
             TyKind::Adt(AdtId(adt), parameters) => Some((*adt, parameters)),
+            _ => None,
+        }
+    }
+
+    fn as_builtin(&self) -> Option<BuiltinType> {
+        match self.kind(&Interner) {
+            TyKind::Str => Some(BuiltinType::Str),
+            TyKind::Scalar(Scalar::Bool) => Some(BuiltinType::Bool),
+            TyKind::Scalar(Scalar::Char) => Some(BuiltinType::Char),
+            TyKind::Scalar(Scalar::Float(fty)) => Some(BuiltinType::Float(match fty {
+                FloatTy::F64 => BuiltinFloat::F64,
+                FloatTy::F32 => BuiltinFloat::F32,
+            })),
+            TyKind::Scalar(Scalar::Int(ity)) => Some(BuiltinType::Int(match ity {
+                IntTy::Isize => BuiltinInt::Isize,
+                IntTy::I8 => BuiltinInt::I8,
+                IntTy::I16 => BuiltinInt::I16,
+                IntTy::I32 => BuiltinInt::I32,
+                IntTy::I64 => BuiltinInt::I64,
+                IntTy::I128 => BuiltinInt::I128,
+            })),
+            TyKind::Scalar(Scalar::Uint(ity)) => Some(BuiltinType::Uint(match ity {
+                UintTy::Usize => BuiltinUint::Usize,
+                UintTy::U8 => BuiltinUint::U8,
+                UintTy::U16 => BuiltinUint::U16,
+                UintTy::U32 => BuiltinUint::U32,
+                UintTy::U64 => BuiltinUint::U64,
+                UintTy::U128 => BuiltinUint::U128,
+            })),
             _ => None,
         }
     }
@@ -146,7 +183,7 @@ impl TyExt for Ty {
 
     fn impl_trait_bounds(&self, db: &dyn HirDatabase) -> Option<Vec<QuantifiedWhereClause>> {
         match self.kind(&Interner) {
-            TyKind::OpaqueType(opaque_ty_id, ..) => {
+            TyKind::OpaqueType(opaque_ty_id, subst) => {
                 match db.lookup_intern_impl_trait_id((*opaque_ty_id).into()) {
                     ImplTraitId::AsyncBlockTypeImplTrait(def, _expr) => {
                         let krate = def.module(db.upcast()).krate();
@@ -169,7 +206,14 @@ impl TyExt for Ty {
                             None
                         }
                     }
-                    ImplTraitId::ReturnTypeImplTrait(..) => None,
+                    ImplTraitId::ReturnTypeImplTrait(func, idx) => {
+                        db.return_type_impl_traits(func).map(|it| {
+                            let data = (*it)
+                                .as_ref()
+                                .map(|rpit| rpit.impl_traits[idx as usize].bounds.clone());
+                            data.substitute(&Interner, &subst).into_value_and_skipped_binders().0
+                        })
+                    }
                 }
             }
             TyKind::Alias(AliasTy::Opaque(opaque_ty)) => {

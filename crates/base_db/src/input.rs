@@ -53,17 +53,21 @@ impl SourceRoot {
 }
 
 /// `CrateGraph` is a bit of information which turns a set of text files into a
-/// number of Rust crates. Each crate is defined by the `FileId` of its root module,
-/// the set of cfg flags (not yet implemented) and the set of dependencies. Note
-/// that, due to cfg's, there might be several crates for a single `FileId`! As
-/// in the rust-lang proper, a crate does not have a name. Instead, names are
-/// specified on dependency edges. That is, a crate might be known under
+/// number of Rust crates.
+///
+/// Each crate is defined by the `FileId` of its root module, the set of enabled
+/// `cfg` flags and the set of dependencies.
+///
+/// Note that, due to cfg's, there might be several crates for a single `FileId`!
+///
+/// For the purposes of analysis, a crate does not have a name. Instead, names
+/// are specified on dependency edges. That is, a crate might be known under
 /// different names in different dependent crates.
 ///
 /// Note that `CrateGraph` is build-system agnostic: it's a concept of the Rust
 /// language proper, not a concept of the build system. In practice, we get
 /// `CrateGraph` by lowering `cargo metadata` output.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default)]
 pub struct CrateGraph {
     arena: FxHashMap<CrateId, CrateData>,
 }
@@ -143,7 +147,7 @@ impl CrateDisplayName {
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
 pub struct ProcMacroId(pub u32);
 
-#[derive(Copy, Clone, Eq, PartialEq, Debug)]
+#[derive(Copy, Clone, Eq, PartialEq, Debug, Hash)]
 pub enum ProcMacroKind {
     CustomDerive,
     FuncLike,
@@ -166,14 +170,7 @@ pub struct ProcMacro {
     pub expander: Arc<dyn ProcMacroExpander>,
 }
 
-impl Eq for ProcMacro {}
-impl PartialEq for ProcMacro {
-    fn eq(&self, other: &ProcMacro) -> bool {
-        self.name == other.name && Arc::ptr_eq(&self.expander, &other.expander)
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct CrateData {
     pub root_file_id: FileId,
     pub edition: Edition,
@@ -185,6 +182,7 @@ pub struct CrateData {
     /// `Dependency` matters), this name should only be used for UI.
     pub display_name: Option<CrateDisplayName>,
     pub cfg_options: CfgOptions,
+    pub potential_cfg_options: CfgOptions,
     pub env: Env,
     pub dependencies: Vec<Dependency>,
     pub proc_macro: Vec<ProcMacro>,
@@ -215,6 +213,7 @@ impl CrateGraph {
         edition: Edition,
         display_name: Option<CrateDisplayName>,
         cfg_options: CfgOptions,
+        potential_cfg_options: CfgOptions,
         env: Env,
         proc_macro: Vec<ProcMacro>,
     ) -> CrateId {
@@ -223,6 +222,7 @@ impl CrateGraph {
             edition,
             display_name,
             cfg_options,
+            potential_cfg_options,
             env,
             proc_macro,
             dependencies: Vec::new(),
@@ -500,6 +500,7 @@ mod tests {
             Edition2018,
             None,
             CfgOptions::default(),
+            CfgOptions::default(),
             Env::default(),
             Default::default(),
         );
@@ -508,6 +509,7 @@ mod tests {
             Edition2018,
             None,
             CfgOptions::default(),
+            CfgOptions::default(),
             Env::default(),
             Default::default(),
         );
@@ -515,6 +517,7 @@ mod tests {
             FileId(3u32),
             Edition2018,
             None,
+            CfgOptions::default(),
             CfgOptions::default(),
             Env::default(),
             Default::default(),
@@ -532,6 +535,7 @@ mod tests {
             Edition2018,
             None,
             CfgOptions::default(),
+            CfgOptions::default(),
             Env::default(),
             Default::default(),
         );
@@ -539,6 +543,7 @@ mod tests {
             FileId(2u32),
             Edition2018,
             None,
+            CfgOptions::default(),
             CfgOptions::default(),
             Env::default(),
             Default::default(),
@@ -555,6 +560,7 @@ mod tests {
             Edition2018,
             None,
             CfgOptions::default(),
+            CfgOptions::default(),
             Env::default(),
             Default::default(),
         );
@@ -563,6 +569,7 @@ mod tests {
             Edition2018,
             None,
             CfgOptions::default(),
+            CfgOptions::default(),
             Env::default(),
             Default::default(),
         );
@@ -570,6 +577,7 @@ mod tests {
             FileId(3u32),
             Edition2018,
             None,
+            CfgOptions::default(),
             CfgOptions::default(),
             Env::default(),
             Default::default(),
@@ -586,6 +594,7 @@ mod tests {
             Edition2018,
             None,
             CfgOptions::default(),
+            CfgOptions::default(),
             Env::default(),
             Default::default(),
         );
@@ -593,6 +602,7 @@ mod tests {
             FileId(2u32),
             Edition2018,
             None,
+            CfgOptions::default(),
             CfgOptions::default(),
             Env::default(),
             Default::default(),

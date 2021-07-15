@@ -174,6 +174,13 @@ Instead, explicitly check for `None`, `Err`, etc.
 `rust-analyzer` is not a library, we don't need to test for API misuse, and we have to handle any user input without panics.
 Panic messages in the logs from the `#[should_panic]` tests are confusing.
 
+## `#[ignore]`
+
+Do not `#[ignore]` tests.
+If the test currently does not work, assert the wrong behavior and add a fixme explaining why it is wrong.
+
+**Rationale:** noticing when the behavior is fixed, making sure that even the wrong behavior is acceptable (ie, not a panic).
+
 ## Function Preconditions
 
 Express function preconditions in types and force the caller to provide them (rather than checking in callee):
@@ -297,6 +304,7 @@ More generally, always prefer types on the left
 &[T]         &Vec<T>
 &str         &String
 Option<&T>   &Option<T>
+&Path        &PathBuf
 ```
 
 **Rationale:** types on the left are strictly more general.
@@ -304,7 +312,7 @@ Even when generality is not required, consistency is important.
 
 ## Constructors
 
-Prefer `Default` to zero-argument `new` function
+Prefer `Default` to zero-argument `new` function.
 
 ```rust
 // GOOD
@@ -332,6 +340,10 @@ Prefer `Default` even it has to be implemented manually.
 Use `Vec::new` rather than `vec![]`.
 
 **Rationale:** uniformity, strength reduction.
+
+Avoid using "dummy" states to implement a `Default`.
+If a type doesn't have a sensible default, empty value, don't hide it.
+Let the caller explicitly decide what's the right initial state is.
 
 ## Functions Over Objects
 
@@ -449,41 +461,38 @@ fn query_all(name: String, case_sensitive: bool) -> Vec<Item> { ... }
 fn query_first(name: String, case_sensitive: bool) -> Option<Item> { ... }
 ```
 
-## Avoid Monomorphization
+## Prefer Separate Functions Over Parameters
 
-Avoid making a lot of code type parametric, *especially* on the boundaries between crates.
-
-```rust
-// GOOD
-fn frobnicate(f: impl FnMut()) {
-    frobnicate_impl(&mut f)
-}
-fn frobnicate_impl(f: &mut dyn FnMut()) {
-    // lots of code
-}
-
-// BAD
-fn frobnicate(f: impl FnMut()) {
-    // lots of code
-}
-```
-
-Avoid `AsRef` polymorphism, it pays back only for widely used libraries:
+If a function has a `bool` or an `Option` parameter, and it is always called with `true`, `false`, `Some` and `None` literals, split the function in two.
 
 ```rust
 // GOOD
-fn frobnicate(f: &Path) {
+fn caller_a() {
+    foo()
 }
+
+fn caller_b() {
+    foo_with_bar(Bar::new())
+}
+
+fn foo() { ... }
+fn foo_with_bar(bar: Bar) { ... }
 
 // BAD
-fn frobnicate(f: impl AsRef<Path>) {
+fn caller_a() {
+    foo(None)
 }
+
+fn caller_b() {
+    foo(Some(Bar::new()))
+}
+
+fn foo(bar: Option<Bar>) { ... }
 ```
 
-**Rationale:** Rust uses monomorphization to compile generic code, meaning that for each instantiation of a generic functions with concrete types, the function is compiled afresh, *per crate*.
-This allows for exceptionally good performance, but leads to increased compile times.
-Runtime performance obeys 80%/20% rule -- only a small fraction of code is hot.
-Compile time **does not** obey this rule -- all code has to be compiled.
+**Rationale:** more often than not, such functions display "`false sharing`" -- they have additional `if` branching inside for two different cases.
+Splitting the two different control flows into two functions simplifies each path, and remove cross-dependencies between the two paths.
+If there's common code between `foo` and `foo_with_bar`, extract *that* into a common helper.
 
 ## Appropriate String Types
 
@@ -577,6 +586,42 @@ pub fn reachable_nodes(node: Node) -> FxHashSet<Node> {
 
 **Rationale:** re-use allocations, accumulator style is more concise for complex cases.
 
+## Avoid Monomorphization
+
+Avoid making a lot of code type parametric, *especially* on the boundaries between crates.
+
+```rust
+// GOOD
+fn frobnicate(f: impl FnMut()) {
+    frobnicate_impl(&mut f)
+}
+fn frobnicate_impl(f: &mut dyn FnMut()) {
+    // lots of code
+}
+
+// BAD
+fn frobnicate(f: impl FnMut()) {
+    // lots of code
+}
+```
+
+Avoid `AsRef` polymorphism, it pays back only for widely used libraries:
+
+```rust
+// GOOD
+fn frobnicate(f: &Path) {
+}
+
+// BAD
+fn frobnicate(f: impl AsRef<Path>) {
+}
+```
+
+**Rationale:** Rust uses monomorphization to compile generic code, meaning that for each instantiation of a generic functions with concrete types, the function is compiled afresh, *per crate*.
+This allows for exceptionally good performance, but leads to increased compile times.
+Runtime performance obeys 80%/20% rule -- only a small fraction of code is hot.
+Compile time **does not** obey this rule -- all code has to be compiled.
+
 # Style
 
 ## Order of Imports
@@ -603,6 +648,10 @@ use crate::{}
 
 // Finally, parent and child modules, but prefer `use crate::`.
 use super::{}
+
+// Re-exports are treated as item definitions rather than imports, so they go
+// after imports and modules. Use them sparingly.
+pub use crate::x::Z;
 ```
 
 **Rationale:** consistency.
@@ -660,6 +709,9 @@ Avoid local `use MyEnum::*` imports.
 
 Prefer `use crate::foo::bar` to `use super::bar` or `use self::bar::baz`.
 **Rationale:** consistency, this is the style which works in all cases.
+
+By default, avoid re-exports.
+**Rationale:** for non-library code, re-exports introduce two ways to use something and allow for inconsistency.
 
 ## Order of Items
 
@@ -733,6 +785,38 @@ impl Parent {
 **Rationale:** easier to get the sense of the API by visually scanning the file.
 If function bodies are folded in the editor, the source code should read as documentation for the public API.
 
+## Context Parameters
+
+Some parameters are threaded unchanged through many function calls.
+They determine the "context" of the operation.
+Pass such parameters first, not last.
+If there are several context parameters, consider packing them into a `struct Ctx` and passing it as `&self`.
+
+```rust
+// GOOD
+fn dfs(graph: &Graph, v: Vertex) -> usize {
+    let mut visited = FxHashSet::default();
+    return go(graph, &mut visited, v);
+
+    fn go(graph: &Graph, visited: &mut FxHashSet<Vertex>, v: usize) -> usize {
+        ...
+    }
+}
+
+// BAD
+fn dfs(v: Vertex, graph: &Graph) -> usize {
+    fn go(v: usize, graph: &Graph, visited: &mut FxHashSet<Vertex>) -> usize {
+        ...
+    }
+
+    let mut visited = FxHashSet::default();
+    go(v, graph, &mut visited)
+}
+```
+
+**Rationale:** consistency.
+Context-first works better when non-context parameter is a lambda.
+
 ## Variable Naming
 
 Use boring and long names for local variables ([yay code completion](https://github.com/rust-analyzer/rust-analyzer/pull/4162#discussion_r417130973)).
@@ -751,13 +835,14 @@ Many names in rust-analyzer conflict with keywords.
 We use mangled names instead of `r#ident` syntax:
 
 ```
-struct -> strukt
 crate  -> krate
-impl   -> imp
-trait  -> trait_
-fn     -> func
 enum   -> enum_
+fn     -> func
+impl   -> imp
 mod    -> module
+struct -> strukt
+trait  -> trait_
+type   -> ty
 ```
 
 **Rationale:** consistency.
@@ -843,7 +928,6 @@ let buf = {
 };
 
 // BAD
-
 let buf = prepare_buf(&mut arena, item);
 
 ...
@@ -860,6 +944,36 @@ Exception: if you want to make use of `return` or `?`.
 **Rationale:** single-use functions change frequently, adding or removing parameters adds churn.
 A block serves just as well to delineate a bit of logic, but has access to all the context.
 Re-using originally single-purpose function often leads to bad coupling.
+
+## Local Helper Functions
+
+Put nested helper functions at the end of the enclosing functions
+(this requires using return statement).
+Don't nest more than one level deep.
+
+```rust
+// GOOD
+fn dfs(graph: &Graph, v: Vertex) -> usize {
+    let mut visited = FxHashSet::default();
+    return go(graph, &mut visited, v);
+
+    fn go(graph: &Graph, visited: &mut FxHashSet<Vertex>, v: usize) -> usize {
+        ...
+    }
+}
+
+// BAD
+fn dfs(graph: &Graph, v: Vertex) -> usize {
+    fn go(graph: &Graph, visited: &mut FxHashSet<Vertex>, v: usize) -> usize {
+        ...
+    }
+
+    let mut visited = FxHashSet::default();
+    go(graph, &mut visited, v)
+}
+```
+
+**Rationale:** consistency, improved top-down readability.
 
 ## Helper Variables
 
@@ -911,7 +1025,29 @@ match p.current() {
 
 ## Documentation
 
+Style inline code comments as proper sentences.
+Start with a capital letter, end with a dot.
+
+```rust
+// GOOD
+
+// Only simple single segment paths are allowed.
+MergeBehavior::Last => {
+    tree.use_tree_list().is_none() && tree.path().map(path_len) <= Some(1)
+}
+
+// BAD
+
+// only simple single segment paths are allowed
+MergeBehavior::Last => {
+    tree.use_tree_list().is_none() && tree.path().map(path_len) <= Some(1)
+}
+```
+
+**Rationale:** writing a sentence (or maybe even a paragraph) rather just "a comment" creates a more appropriate frame of mind.
+It tricks you into writing down more of the context you keep in your head while coding.
+
 For `.md` and `.adoc` files, prefer a sentence-per-line format, don't wrap lines.
 If the line is too long, you want to split the sentence in two :-)
 
-**Rationale:** much easier to edit the text and read the diff.
+**Rationale:** much easier to edit the text and read the diff, see [this link](https://asciidoctor.org/docs/asciidoc-recommended-practices/#one-sentence-per-line).

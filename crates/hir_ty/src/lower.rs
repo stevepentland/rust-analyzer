@@ -10,6 +10,7 @@ use std::{iter, sync::Arc};
 
 use base_db::CrateId;
 use chalk_ir::{cast::Cast, fold::Shift, interner::HasInterner, Mutability, Safety};
+use hir_def::intern::Interned;
 use hir_def::{
     adt::StructKind,
     body::{Expander, LowerCtx},
@@ -29,15 +30,15 @@ use stdx::impl_from;
 use syntax::ast;
 
 use crate::{
+    consteval,
     db::HirDatabase,
-    dummy_usize_const,
     mapping::ToChalk,
     static_lifetime, to_assoc_type_id, to_chalk_trait_id, to_placeholder_idx,
     utils::{
         all_super_trait_refs, associated_type_by_name_including_super_traits, generics, Generics,
     },
     AliasEq, AliasTy, Binders, BoundVar, CallableSig, DebruijnIndex, DynTy, FnPointer, FnSig,
-    FnSubst, ImplTraitId, Interner, OpaqueTy, PolyFnSig, ProjectionTy, QuantifiedWhereClause,
+    FnSubst, ImplTraitId, Interner, PolyFnSig, ProjectionTy, QuantifiedWhereClause,
     QuantifiedWhereClauses, ReturnTypeImplTrait, ReturnTypeImplTraits, Substitution,
     TraitEnvironment, TraitRef, TraitRefExt, Ty, TyBuilder, TyKind, WhereClause,
 };
@@ -172,9 +173,12 @@ impl<'a> TyLoweringContext<'a> {
                 let inner_ty = self.lower_ty(inner);
                 TyKind::Raw(lower_to_chalk_mutability(*mutability), inner_ty).intern(&Interner)
             }
-            TypeRef::Array(inner) => {
+            TypeRef::Array(inner, len) => {
                 let inner_ty = self.lower_ty(inner);
-                TyKind::Array(inner_ty, dummy_usize_const()).intern(&Interner)
+
+                let const_len = consteval::usize_const(len.as_usize());
+
+                TyKind::Array(inner_ty, const_len).intern(&Interner)
             }
             TypeRef::Slice(inner) => {
                 let inner_ty = self.lower_ty(inner);
@@ -234,7 +238,7 @@ impl<'a> TyLoweringContext<'a> {
                         // away instead of two.
                         let actual_opaque_type_data = self
                             .with_debruijn(DebruijnIndex::INNERMOST, |ctx| {
-                                ctx.lower_impl_trait(&bounds)
+                                ctx.lower_impl_trait(bounds)
                             });
                         self.opaque_type_data.borrow_mut()[idx as usize] = actual_opaque_type_data;
 
@@ -246,11 +250,7 @@ impl<'a> TyLoweringContext<'a> {
                         let opaque_ty_id = self.db.intern_impl_trait_id(impl_trait_id).into();
                         let generics = generics(self.db.upcast(), func.into());
                         let parameters = generics.bound_vars_subst(self.in_binders);
-                        TyKind::Alias(AliasTy::Opaque(OpaqueTy {
-                            opaque_ty_id,
-                            substitution: parameters,
-                        }))
-                        .intern(&Interner)
+                        TyKind::OpaqueType(opaque_ty_id, parameters).intern(&Interner)
                     }
                     ImplTraitLoweringMode::Param => {
                         let idx = self.impl_trait_counter.get();
@@ -414,17 +414,16 @@ impl<'a> TyLoweringContext<'a> {
                     self.lower_trait_ref_from_resolved_path(trait_, resolved_segment, self_ty);
                 let ty = if remaining_segments.len() == 1 {
                     let segment = remaining_segments.first().unwrap();
-                    let found = associated_type_by_name_including_super_traits(
-                        self.db,
-                        trait_ref,
-                        &segment.name,
-                    );
+                    let found = self
+                        .db
+                        .trait_data(trait_ref.hir_trait_id())
+                        .associated_type_by_name(segment.name);
                     match found {
-                        Some((super_trait_ref, associated_ty)) => {
+                        Some(associated_ty) => {
                             // FIXME handle type parameters on the segment
                             TyKind::Alias(AliasTy::Projection(ProjectionTy {
                                 associated_ty_id: to_assoc_type_id(associated_ty),
-                                substitution: super_trait_ref.substitution,
+                                substitution: trait_ref.substitution,
                             }))
                             .intern(&Interner)
                         }
@@ -502,7 +501,7 @@ impl<'a> TyLoweringContext<'a> {
     pub(crate) fn lower_path(&self, path: &Path) -> (Ty, Option<TypeNs>) {
         // Resolve the path (in type namespace)
         if let Some(type_ref) = path.type_anchor() {
-            let (ty, res) = self.lower_ty_ext(&type_ref);
+            let (ty, res) = self.lower_ty_ext(type_ref);
             return self.lower_ty_relative_path(ty, res, path.segments());
         }
         let (resolution, remaining_index) =
@@ -559,7 +558,7 @@ impl<'a> TyLoweringContext<'a> {
                 },
             );
 
-            ty.unwrap_or(TyKind::Error.intern(&Interner))
+            ty.unwrap_or_else(|| TyKind::Error.intern(&Interner))
         } else {
             TyKind::Error.intern(&Interner)
         }
@@ -781,7 +780,12 @@ impl<'a> TyLoweringContext<'a> {
         let trait_ref = match bound {
             TypeBound::Path(path) => {
                 bindings = self.lower_trait_ref_from_path(path, Some(self_ty));
-                bindings.clone().map(WhereClause::Implemented).map(|b| crate::wrap_empty_binders(b))
+                bindings.clone().map(WhereClause::Implemented).map(crate::wrap_empty_binders)
+            }
+            TypeBound::ForLifetime(_, path) => {
+                // FIXME Don't silently drop the hrtb lifetimes here
+                bindings = self.lower_trait_ref_from_path(path, Some(self_ty));
+                bindings.clone().map(WhereClause::Implemented).map(crate::wrap_empty_binders)
             }
             TypeBound::Lifetime(_) => None,
             TypeBound::Error => None,
@@ -800,7 +804,7 @@ impl<'a> TyLoweringContext<'a> {
         trait_ref: TraitRef,
     ) -> impl Iterator<Item = QuantifiedWhereClause> + 'a {
         let last_segment = match bound {
-            TypeBound::Path(path) => path.segments().last(),
+            TypeBound::Path(path) | TypeBound::ForLifetime(_, path) => path.segments().last(),
             TypeBound::Error | TypeBound::Lifetime(_) => None,
         };
         last_segment
@@ -841,7 +845,7 @@ impl<'a> TyLoweringContext<'a> {
             })
     }
 
-    fn lower_impl_trait(&self, bounds: &[TypeBound]) -> ReturnTypeImplTrait {
+    fn lower_impl_trait(&self, bounds: &[Interned<TypeBound>]) -> ReturnTypeImplTrait {
         cov_mark::hit!(lower_rpit);
         let self_ty =
             TyKind::BoundVar(BoundVar::new(DebruijnIndex::INNERMOST, 0)).intern(&Interner);
@@ -954,7 +958,7 @@ pub(crate) fn field_types_query(
 /// like `T::Item`.
 ///
 /// See the analogous query in rustc and its comment:
-/// https://github.com/rust-lang/rust/blob/9150f844e2624eb013ec78ca08c1d416e6644026/src/librustc_typeck/astconv.rs#L46
+/// <https://github.com/rust-lang/rust/blob/9150f844e2624eb013ec78ca08c1d416e6644026/src/librustc_typeck/astconv.rs#L46>
 /// This is a query mostly to handle cycles somewhat gracefully; e.g. the
 /// following bounds are disallowed: `T: Foo<U::Item>, U: Foo<T::Item>`, but
 /// these are fine: `T: Foo<U::Item>, U: Foo<()>`.
@@ -1023,7 +1027,7 @@ pub(crate) fn trait_environment_query(
     };
     if let Some(AssocContainerId::TraitId(trait_id)) = container {
         // add `Self: Trait<T1, T2, ...>` to the environment in trait
-        // function default implementations (and hypothetical code
+        // function default implementations (and speculative code
         // inside consts or type aliases)
         cov_mark::hit!(trait_self_implements_self);
         let substs = TyBuilder::type_params_subst(db, trait_id);
@@ -1033,9 +1037,11 @@ pub(crate) fn trait_environment_query(
         clauses.push(program_clause.into_from_env_clause(&Interner));
     }
 
+    let krate = def.module(db.upcast()).krate();
+
     let env = chalk_ir::Environment::new(&Interner).add_clauses(&Interner, clauses);
 
-    Arc::new(TraitEnvironment { traits_from_clauses: traits_in_scope, env })
+    Arc::new(TraitEnvironment { krate, traits_from_clauses: traits_in_scope, env })
 }
 
 /// Resolve the where clause(s) of an item with generics.
@@ -1081,6 +1087,27 @@ pub(crate) fn generic_defaults_query(
                     bound.shifted_in_from(binders).to_ty(&Interner)
                 }
             });
+
+            crate::make_only_type_binders(idx, ty)
+        })
+        .collect();
+
+    defaults
+}
+
+pub(crate) fn generic_defaults_recover(
+    db: &dyn HirDatabase,
+    _cycle: &[String],
+    def: &GenericDefId,
+) -> Arc<[Binders<Ty>]> {
+    let generic_params = generics(db.upcast(), *def);
+
+    // we still need one default per parameter
+    let defaults = generic_params
+        .iter()
+        .enumerate()
+        .map(|(idx, _)| {
+            let ty = TyKind::Error.intern(&Interner);
 
             crate::make_only_type_binders(idx, ty)
         })

@@ -1,10 +1,9 @@
 import * as cp from 'child_process';
 import * as os from 'os';
 import * as path from 'path';
-import * as fs from 'fs';
 import * as readline from 'readline';
-import { OutputChannel } from 'vscode';
-import { log, memoize } from './util';
+import * as vscode from 'vscode';
+import { execute, log, memoize } from './util';
 
 interface CompilationArtifact {
     fileName: string;
@@ -19,7 +18,7 @@ export interface ArtifactSpec {
 }
 
 export class Cargo {
-    constructor(readonly rootFolder: string, readonly output: OutputChannel) { }
+    constructor(readonly rootFolder: string, readonly output: vscode.OutputChannel) { }
 
     // Made public for testing purposes
     static artifactSpec(args: readonly string[]): ArtifactSpec {
@@ -121,6 +120,24 @@ export class Cargo {
     }
 }
 
+/** Mirrors `project_model::sysroot::discover_sysroot_dir()` implementation*/
+export function getSysroot(dir: string): Promise<string> {
+    const rustcPath = getPathForExecutable("rustc");
+
+    // do not memoize the result because the toolchain may change between runs
+    return execute(`${rustcPath} --print sysroot`, { cwd: dir });
+}
+
+export async function getRustcId(dir: string): Promise<string> {
+    const rustcPath = getPathForExecutable("rustc");
+
+    // do not memoize the result because the toolchain may change between runs
+    const data = await execute(`${rustcPath} -V -v`, { cwd: dir });
+    const rx = /commit-hash:\s(.*)$/m.compile();
+
+    return rx.exec(data)![1];
+}
+
 /** Mirrors `toolchain::cargo()` implementation */
 export function cargoPath(): string {
     return getPathForExecutable("cargo");
@@ -140,9 +157,9 @@ export const getPathForExecutable = memoize(
         try {
             // hmm, `os.homedir()` seems to be infallible
             // it is not mentioned in docs and cannot be infered by the type signature...
-            const standardPath = path.join(os.homedir(), ".cargo", "bin", executableName);
+            const standardPath = vscode.Uri.joinPath(vscode.Uri.file(os.homedir()), ".cargo", "bin", executableName);
 
-            if (isFile(standardPath)) return standardPath;
+            if (isFileAtUri(standardPath)) return standardPath.fsPath;
         } catch (err) {
             log.error("Failed to read the fs info", err);
         }
@@ -160,14 +177,16 @@ function lookupInPath(exec: string): boolean {
             : [candidate];
     });
 
-    return candidates.some(isFile);
+    return candidates.some(isFileAtPath);
 }
 
-function isFile(suspectPath: string): boolean {
-    // It is not mentionned in docs, but `statSync()` throws an error when
-    // the path doesn't exist
+async function isFileAtPath(path: string): Promise<boolean> {
+    return isFileAtUri(vscode.Uri.file(path));
+}
+
+async function isFileAtUri(uri: vscode.Uri): Promise<boolean> {
     try {
-        return fs.statSync(suspectPath).isFile();
+        return ((await vscode.workspace.fs.stat(uri)).type & vscode.FileType.File) !== 0;
     } catch {
         return false;
     }
