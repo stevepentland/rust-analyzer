@@ -1,28 +1,56 @@
 [package]
 name = "hir"
 version = "0.0.0"
-description = "TBD"
-license = "MIT OR Apache-2.0"
-edition = "2021"
-rust-version = "1.56"
+repository.workspace = true
+description = "A high-level object-oriented access to Rust code for rust-analyzer."
+
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
 
 [lib]
 doctest = false
 
 [dependencies]
-rustc-hash = "1.1.0"
-either = "1.5.3"
-arrayvec = "0.7"
-itertools = "0.10.0"
-smallvec = "1.4.0"
-once_cell = "1"
+rustc-hash.workspace = true
+either.workspace = true
+arrayvec.workspace = true
+itertools.workspace = true
+serde_json.workspace = true
+smallvec.workspace = true
+tracing = { workspace = true, features = ["attributes"] }
+triomphe.workspace = true
+la-arena.workspace = true
+salsa.workspace = true
 
-stdx = { path = "../stdx", version = "0.0.0" }
-syntax = { path = "../syntax", version = "0.0.0" }
-base_db = { path = "../base_db", version = "0.0.0" }
-profile = { path = "../profile", version = "0.0.0" }
-hir_expand = { path = "../hir_expand", version = "0.0.0" }
-hir_def = { path = "../hir_def", version = "0.0.0" }
-hir_ty = { path = "../hir_ty", version = "0.0.0" }
-tt = { path = "../tt", version = "0.0.0" }
-cfg = { path = "../cfg", version = "0.0.0" }
+ra-ap-rustc_type_ir.workspace = true
+
+# local deps
+base-db.workspace = true
+cfg.workspace = true
+hir-def.workspace = true
+hir-expand.workspace = true
+hir-ide.workspace = true
+intern.workspace = true
+stdx.workspace = true
+syntax.workspace = true
+tt.workspace = true
+span.workspace = true
+
+[dev-dependencies]
+expect-test.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tracing-tree.workspace = true
+
+# local deps
+test-utils.workspace = true
+test-fixture.workspace = true
+syntax-bridge.workspace = true
+
+[features]
+in-rust-tree = ["hir-expand/in-rust-tree"]
+
+[lints]
+workspace = true

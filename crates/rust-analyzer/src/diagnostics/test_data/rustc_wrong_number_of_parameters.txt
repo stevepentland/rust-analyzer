@@ -23,9 +23,7 @@
                 },
             },
             severity: Some(
-                DiagnosticSeverity(
-                    1,
-                ),
+                Error,
             ),
             code: Some(
                 String(
@@ -56,7 +54,10 @@
             source: Some(
                 "rustc",
             ),
-            message: "this function takes 2 parameters but 3 parameters were supplied\nexpected 2 parameters",
+            message: String(
+                "this function takes 2 parameters but 3 parameters were supplied\nexpected 2 parameters",
+            ),
+            tags: None,
             related_information: Some(
                 [
                     DiagnosticRelatedInformation {
@@ -87,10 +88,9 @@
                     },
                 ],
             ),
-            tags: None,
             data: None,
         },
-        fixes: [],
+        fix: None,
     },
     MappedRustDiagnostic {
         url: Url {
@@ -116,9 +116,7 @@
                 },
             },
             severity: Some(
-                DiagnosticSeverity(
-                    4,
-                ),
+                Hint,
             ),
             code: Some(
                 String(
@@ -149,7 +147,10 @@
             source: Some(
                 "rustc",
             ),
-            message: "defined here",
+            message: String(
+                "defined here",
+            ),
+            tags: None,
             related_information: Some(
                 [
                     DiagnosticRelatedInformation {
@@ -180,9 +181,8 @@
                     },
                 ],
             ),
-            tags: None,
             data: None,
         },
-        fixes: [],
+        fix: None,
     },
 ]

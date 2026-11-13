@@ -3,16 +3,14 @@
 //! Measures the total size of all currently allocated objects.
 use std::fmt;
 
-use cfg_if::cfg_if;
-
 #[derive(Copy, Clone)]
 pub struct MemoryUsage {
     pub allocated: Bytes,
 }
 
 impl fmt::Display for MemoryUsage {
-    fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
-        write!(fmt, "{}", self.allocated)
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.allocated.fmt(f)
     }
 }
 
@@ -25,33 +23,32 @@ impl std::ops::Sub for MemoryUsage {
 
 impl MemoryUsage {
     pub fn now() -> MemoryUsage {
-        cfg_if! {
-            if #[cfg(all(feature = "jemalloc", not(target_env = "msvc")))] {
+        cfg_select! {
+            all(feature = "jemalloc", not(target_env = "msvc")) => {
                 jemalloc_ctl::epoch::advance().unwrap();
                 MemoryUsage {
                     allocated: Bytes(jemalloc_ctl::stats::allocated::read().unwrap() as isize),
                 }
-            } else if #[cfg(all(target_os = "linux", target_env = "gnu"))] {
-                memusage_linux()
-            } else if #[cfg(windows)] {
+            }
+            all(target_os = "linux", target_env = "gnu") => memusage_linux(),
+            windows => {
                 // There doesn't seem to be an API for determining heap usage, so we try to
                 // approximate that by using the Commit Charge value.
 
-                use winapi::um::processthreadsapi::*;
-                use winapi::um::psapi::*;
-                use std::mem::{MaybeUninit, size_of};
+                use std::mem::MaybeUninit;
+                use windows_sys::Win32::System::{ProcessStatus::*, Threading::*};
 
                 let proc = unsafe { GetCurrentProcess() };
                 let mut mem_counters = MaybeUninit::uninit();
                 let cb = size_of::<PROCESS_MEMORY_COUNTERS>();
-                let ret = unsafe { GetProcessMemoryInfo(proc, mem_counters.as_mut_ptr(), cb as u32) };
+                let ret =
+                    unsafe { GetProcessMemoryInfo(proc, mem_counters.as_mut_ptr(), cb as u32) };
                 assert!(ret != 0);
 
                 let usage = unsafe { mem_counters.assume_init().PagefileUsage };
                 MemoryUsage { allocated: Bytes(usage as isize) }
-            } else {
-                MemoryUsage { allocated: Bytes(0) }
             }
+            _ => MemoryUsage { allocated: Bytes(0) },
         }
     }
 }
@@ -63,15 +60,13 @@ fn memusage_linux() -> MemoryUsage {
     // mallinfo2 is very recent, so its presence needs to be detected at runtime.
     // Both are abysmally slow.
 
-    use std::ffi::CStr;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     static MALLINFO2: AtomicUsize = AtomicUsize::new(1);
 
     let mut mallinfo2 = MALLINFO2.load(Ordering::Relaxed);
     if mallinfo2 == 1 {
-        let cstr = CStr::from_bytes_with_nul(b"mallinfo2\0").unwrap();
-        mallinfo2 = unsafe { libc::dlsym(libc::RTLD_DEFAULT, cstr.as_ptr()) } as usize;
+        mallinfo2 = unsafe { libc::dlsym(libc::RTLD_DEFAULT, c"mallinfo2".as_ptr()) } as usize;
         // NB: races don't matter here, since they'll always store the same value
         MALLINFO2.store(mallinfo2, Ordering::Relaxed);
     }
@@ -81,7 +76,8 @@ fn memusage_linux() -> MemoryUsage {
         let alloc = unsafe { libc::mallinfo() }.uordblks as isize;
         MemoryUsage { allocated: Bytes(alloc) }
     } else {
-        let mallinfo2: fn() -> libc::mallinfo2 = unsafe { std::mem::transmute(mallinfo2) };
+        let mallinfo2: extern "C" fn() -> libc::mallinfo2 =
+            unsafe { std::mem::transmute(mallinfo2) };
         let alloc = mallinfo2().uordblks as isize;
         MemoryUsage { allocated: Bytes(alloc) }
     }
@@ -91,13 +87,19 @@ fn memusage_linux() -> MemoryUsage {
 pub struct Bytes(isize);
 
 impl Bytes {
+    pub fn new(bytes: isize) -> Bytes {
+        Bytes(bytes)
+    }
+}
+
+impl Bytes {
     pub fn megabytes(self) -> isize {
         self.0 / 1024 / 1024
     }
 }
 
 impl fmt::Display for Bytes {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let bytes = self.0;
         let mut value = bytes;
         let mut suffix = "b";
@@ -109,7 +111,7 @@ impl fmt::Display for Bytes {
                 suffix = "mb";
             }
         }
-        f.pad(&format!("{}{}", value, suffix))
+        f.pad(&format!("{value}{suffix}"))
     }
 }
 

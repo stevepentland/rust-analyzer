@@ -23,9 +23,7 @@
                 },
             },
             severity: Some(
-                DiagnosticSeverity(
-                    1,
-                ),
+                Error,
             ),
             code: Some(
                 String(
@@ -56,11 +54,13 @@
             source: Some(
                 "rustc",
             ),
-            message: "can't compare `{integer}` with `&str`\nthe trait `std::cmp::PartialEq<&str>` is not implemented for `{integer}`",
-            related_information: None,
+            message: String(
+                "can't compare `{integer}` with `&str`\nthe trait `std::cmp::PartialEq<&str>` is not implemented for `{integer}`",
+            ),
             tags: None,
+            related_information: None,
             data: None,
         },
-        fixes: [],
+        fix: None,
     },
 ]

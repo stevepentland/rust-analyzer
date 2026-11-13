@@ -2,21 +2,27 @@
 
 use std::{env, path::PathBuf, str};
 
-use anyhow::{bail, format_err, Context, Result};
-use xshell::{cmd, pushd};
+use anyhow::{Context, bail, format_err};
+use xshell::{Shell, cmd};
 
-use crate::flags;
+use crate::{
+    flags::{self, Malloc, PgoTrainingCrate},
+    util::detect_target,
+};
 
 impl flags::Install {
-    pub(crate) fn run(self) -> Result<()> {
+    pub(crate) fn run(self, sh: &Shell) -> anyhow::Result<()> {
         if cfg!(target_os = "macos") {
-            fix_path_for_mac().context("Fix path for mac")?;
+            fix_path_for_mac(sh).context("Fix path for mac")?;
         }
         if let Some(server) = self.server() {
-            install_server(server).context("install server")?;
+            install_server(sh, server).context("install server")?;
+        }
+        if let Some(server) = self.proc_macro_server() {
+            install_proc_macro_server(sh, server).context("install proc-macro server")?;
         }
         if let Some(client) = self.client() {
-            install_client(client).context("install client")?;
+            install_client(sh, client).context("install client")?;
         }
         Ok(())
     }
@@ -31,72 +37,79 @@ const VS_CODES: &[&str] = &["code", "code-exploration", "code-insiders", "codium
 
 pub(crate) struct ServerOpt {
     pub(crate) malloc: Malloc,
+    pub(crate) dev_rel: bool,
+    pub(crate) pgo: Option<PgoTrainingCrate>,
+    pub(crate) force_always_assert: bool,
 }
 
-pub(crate) enum Malloc {
-    System,
-    Mimalloc,
-    Jemalloc,
+impl ServerOpt {
+    fn to_features(&self) -> Vec<&'static str> {
+        let malloc_features = self.malloc.to_features();
+        let mut features = Vec::with_capacity(
+            malloc_features.len() + if self.force_always_assert { 2 } else { 0 },
+        );
+        features.extend(malloc_features);
+        if self.force_always_assert {
+            features.extend(["--features", "force-always-assert"]);
+        }
+        features
+    }
 }
 
-fn fix_path_for_mac() -> Result<()> {
+pub(crate) struct ProcMacroServerOpt {
+    pub(crate) dev_rel: bool,
+}
+
+fn fix_path_for_mac(sh: &Shell) -> anyhow::Result<()> {
     let mut vscode_path: Vec<PathBuf> = {
         const COMMON_APP_PATH: &str =
             r"/Applications/Visual Studio Code.app/Contents/Resources/app/bin";
         const ROOT_DIR: &str = "";
-        let home_dir = match env::var("HOME") {
-            Ok(home) => home,
-            Err(e) => bail!("Failed getting HOME from environment with error: {}.", e),
-        };
+        let home_dir = sh.var("HOME").map_err(|err| {
+            format_err!("Failed getting HOME from environment with error: {}.", err)
+        })?;
 
         [ROOT_DIR, &home_dir]
-            .iter()
-            .map(|dir| String::from(*dir) + COMMON_APP_PATH)
+            .into_iter()
+            .map(|dir| dir.to_owned() + COMMON_APP_PATH)
             .map(PathBuf::from)
             .filter(|path| path.exists())
             .collect()
     };
 
     if !vscode_path.is_empty() {
-        let vars = match env::var_os("PATH") {
-            Some(path) => path,
-            None => bail!("Could not get PATH variable from env."),
-        };
+        let vars = sh.var_os("PATH").context("Could not get PATH variable from env.")?;
 
         let mut paths = env::split_paths(&vars).collect::<Vec<_>>();
         paths.append(&mut vscode_path);
         let new_paths = env::join_paths(paths).context("build env PATH")?;
-        env::set_var("PATH", &new_paths);
+        sh.set_var("PATH", new_paths);
     }
 
     Ok(())
 }
 
-fn install_client(client_opt: ClientOpt) -> Result<()> {
-    let _dir = pushd("./editors/code");
+fn install_client(sh: &Shell, client_opt: ClientOpt) -> anyhow::Result<()> {
+    let _dir = sh.push_dir("./editors/code");
 
     // Package extension.
     if cfg!(unix) {
-        cmd!("npm --version").run().context("`npm` is required to build the VS Code plugin")?;
-        cmd!("npm ci").run()?;
+        cmd!(sh, "npm --version").run().context("`npm` is required to build the VS Code plugin")?;
+        cmd!(sh, "npm ci").run()?;
 
-        cmd!("npm run package --scripts-prepend-node-path").run()?;
+        cmd!(sh, "npm run package --scripts-prepend-node-path").run()?;
     } else {
-        cmd!("cmd.exe /c npm --version")
+        cmd!(sh, "cmd.exe /c npm --version")
             .run()
             .context("`npm` is required to build the VS Code plugin")?;
-        cmd!("cmd.exe /c npm ci").run()?;
+        cmd!(sh, "cmd.exe /c npm ci").run()?;
 
-        cmd!("cmd.exe /c npm run package").run()?;
+        cmd!(sh, "cmd.exe /c npm run package").run()?;
     };
 
     // Find the appropriate VS Code binary.
-    let lifetime_extender;
     let candidates: &[&str] = match client_opt.code_bin.as_deref() {
-        Some(it) => {
-            lifetime_extender = [it];
-            &lifetime_extender[..]
-        }
+        Some(it) => &[it],
         None => VS_CODES,
     };
     let code = candidates
@@ -104,9 +117,9 @@ fn install_client(client_opt: ClientOpt) -> Result<()> {
         .copied()
         .find(|&bin| {
             if cfg!(unix) {
-                cmd!("{bin} --version").read().is_ok()
+                cmd!(sh, "{bin} --version").read().is_ok()
             } else {
-                cmd!("cmd.exe /c {bin}.cmd --version").read().is_ok()
+                cmd!(sh, "cmd.exe /c {bin}.cmd --version").read().is_ok()
             }
         })
         .ok_or_else(|| {
@@ -115,17 +128,17 @@ fn install_client(client_opt: ClientOpt) -> Result<()> {
 
     // Install & verify.
     let installed_extensions = if cfg!(unix) {
-        cmd!("{code} --install-extension rust-analyzer.vsix --force").run()?;
-        cmd!("{code} --list-extensions").read()?
+        cmd!(sh, "{code} --install-extension rust-analyzer.vsix --force").run()?;
+        cmd!(sh, "{code} --list-extensions").read()?
     } else {
-        cmd!("cmd.exe /c {code}.cmd --install-extension rust-analyzer.vsix --force").run()?;
-        cmd!("cmd.exe /c {code}.cmd --list-extensions").read()?
+        cmd!(sh, "cmd.exe /c {code}.cmd --install-extension rust-analyzer.vsix --force").run()?;
+        cmd!(sh, "cmd.exe /c {code}.cmd --list-extensions").read()?
     };
 
     if !installed_extensions.contains("rust-analyzer") {
         bail!(
             "Could not install the Visual Studio Code extension. \
-            Please make sure you have at least NodeJS 12.x together with the latest version of VS Code installed and try again. \
+            Please make sure you have at least NodeJS 16.x together with the latest version of VS Code installed and try again. \
             Note that installing via xtask install does not work for VS Code Remote, instead you’ll need to install the .vsix manually."
         );
     }
@@ -133,14 +146,44 @@ fn install_client(client_opt: ClientOpt) -> Result<()> {
     Ok(())
 }
 
-fn install_server(opts: ServerOpt) -> Result<()> {
-    let features = match opts.malloc {
-        Malloc::System => &[][..],
-        Malloc::Mimalloc => &["--features", "mimalloc"],
-        Malloc::Jemalloc => &["--features", "jemalloc"],
-    };
+fn install_server(sh: &Shell, opts: ServerOpt) -> anyhow::Result<()> {
+    let features = &opts.to_features();
+    let profile = if opts.dev_rel { "dev-rel" } else { "release" };
 
-    let cmd = cmd!("cargo install --path crates/rust-analyzer --locked --force --features force-always-assert {features...}");
+    let mut install_cmd = cmd!(
+        sh,
+        "cargo install --path crates/rust-analyzer --profile={profile} --locked --force {features...}"
+    );
+
+    if let Some(train_crate) = opts.pgo {
+        let target = detect_target(sh);
+        let build_cmd = cmd!(
+            sh,
+            "cargo build --manifest-path ./crates/rust-analyzer/Cargo.toml --bin rust-analyzer --target {target} --profile={profile} --locked {features...}"
+        );
+
+        let profile = crate::pgo::gather_pgo_profile(sh, build_cmd, &target, train_crate)?;
+        install_cmd = crate::pgo::apply_pgo_to_cmd(install_cmd, &profile);
+    }
+
+    install_cmd.run()?;
+    Ok(())
+}
+
+fn install_proc_macro_server(sh: &Shell, opts: ProcMacroServerOpt) -> anyhow::Result<()> {
+    let profile = if opts.dev_rel { "dev-rel" } else { "release" };
+
+    let mut cmd = cmd!(
+        sh,
+        "cargo install --path crates/proc-macro-srv-cli --profile={profile} --locked --force --features in-rust-tree"
+    );
+    if std::env::var_os("RUSTUP_TOOLCHAIN").is_none() {
+        cmd = cmd.env("RUSTUP_TOOLCHAIN", "nightly");
+    } else {
+        cmd = cmd.env("RUSTC_BOOTSTRAP", "1");
+    }
+
     cmd.run()?;
+
     Ok(())
 }

@@ -47,7 +47,8 @@ impl SyntaxTreeBuilder {
 
     pub fn finish(self) -> Parse<SyntaxNode> {
         let (green, errors) = self.finish_raw();
-        // Disable block validation, see https://github.com/rust-analyzer/rust-analyzer/pull/10357
+        // Disable block validation, see https://github.com/rust-lang/rust-analyzer/pull/10357
+        #[allow(clippy::overly_complex_bool_expr)]
         if cfg!(debug_assertions) && false {
             let node = SyntaxNode::new_root(green.clone());
             crate::validation::validate_block_structure(&node);
@@ -69,7 +70,7 @@ impl SyntaxTreeBuilder {
         self.inner.finish_node();
     }
 
-    pub fn error(&mut self, error: parser::ParseError, text_pos: TextSize) {
-        self.errors.push(SyntaxError::new_at_offset(*error.0, text_pos));
+    pub fn error(&mut self, error: String, text_pos: TextSize) {
+        self.errors.push(SyntaxError::new_at_offset(error, text_pos));
     }
 }

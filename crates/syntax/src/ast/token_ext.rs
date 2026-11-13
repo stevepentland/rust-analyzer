@@ -1,51 +1,33 @@
 //! There are many AstNodes, but only a few tokens, so we hand-write them here.
 
-use std::borrow::Cow;
+use std::ops::Range;
+use std::{borrow::Cow, num::ParseIntError};
 
-use rustc_lexer::unescape::{unescape_literal, Mode};
+use parser::SyntaxKind;
+use rustc_literal_escaper::{
+    EscapeError, MixedUnit, unescape_byte, unescape_byte_str, unescape_c_str, unescape_char,
+    unescape_str,
+};
+use stdx::always;
 
 use crate::{
-    ast::{self, AstToken},
-    TextRange, TextSize,
+    SyntaxToken, TextRange, TextSize,
+    ast::{self, AstToken, AttrKind},
 };
 
 impl ast::Comment {
-    pub fn kind(&self) -> CommentKind {
-        CommentKind::from_text(self.text())
+    pub fn shape(&self) -> CommentShape {
+        CommentShape::from_text(self.text())
     }
 
-    pub fn is_inner(&self) -> bool {
-        self.kind().doc == Some(CommentPlacement::Inner)
-    }
-
-    pub fn is_outer(&self) -> bool {
-        self.kind().doc == Some(CommentPlacement::Outer)
-    }
-
-    pub fn prefix(&self) -> &'static str {
-        let &(prefix, _kind) = CommentKind::BY_PREFIX
-            .iter()
-            .find(|&(prefix, kind)| self.kind() == *kind && self.text().starts_with(prefix))
-            .unwrap();
-        prefix
-    }
-
-    /// Returns the textual content of a doc comment node as a single string with prefix and suffix
-    /// removed.
-    pub fn doc_comment(&self) -> Option<&str> {
-        let kind = self.kind();
-        match kind {
-            CommentKind { shape, doc: Some(_) } => {
-                let prefix = kind.prefix();
-                let text = &self.text()[prefix.len()..];
-                let text = if shape == CommentShape::Block {
-                    text.strip_suffix("*/").unwrap_or(text)
-                } else {
-                    text
-                };
-                Some(text)
-            }
-            _ => None,
+    /// Returns the text without the `//` or `/*...*/` markers.
+    pub fn text_without_markers(&self) -> &str {
+        let text = self.text();
+        let shape = CommentShape::from_text(text);
+        let text = &text[2..];
+        match shape {
+            CommentShape::Block => text.strip_suffix("*/").unwrap_or(text),
+            CommentShape::Line => text,
         }
     }
 }
@@ -53,7 +35,20 @@ impl ast::Comment {
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub struct CommentKind {
     pub shape: CommentShape,
-    pub doc: Option<CommentPlacement>,
+    pub doc: Option<AttrKind>,
+}
+
+impl CommentKind {
+    pub fn prefix(&self) -> &'static str {
+        match (self.shape, self.doc) {
+            (CommentShape::Line, None) => "//",
+            (CommentShape::Line, Some(AttrKind::Inner)) => "//!",
+            (CommentShape::Line, Some(AttrKind::Outer)) => "///",
+            (CommentShape::Block, None) => "/*",
+            (CommentShape::Block, Some(AttrKind::Inner)) => "/*!",
+            (CommentShape::Block, Some(AttrKind::Outer)) => "/**",
+        }
+    }
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -63,6 +58,11 @@ pub enum CommentShape {
 }
 
 impl CommentShape {
+    #[inline]
+    pub fn from_text(text: &str) -> CommentShape {
+        if text.starts_with("/*") { CommentShape::Block } else { CommentShape::Line }
+    }
+
     pub fn is_line(self) -> bool {
         self == CommentShape::Line
     }
@@ -72,47 +72,91 @@ impl CommentShape {
     }
 }
 
-#[derive(Debug, PartialEq, Eq, Clone, Copy)]
-pub enum CommentPlacement {
-    Inner,
-    Outer,
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct AnyComment {
+    syntax: SyntaxToken,
 }
 
-impl CommentKind {
-    const BY_PREFIX: [(&'static str, CommentKind); 9] = [
-        ("/**/", CommentKind { shape: CommentShape::Block, doc: None }),
-        ("/***", CommentKind { shape: CommentShape::Block, doc: None }),
-        ("////", CommentKind { shape: CommentShape::Line, doc: None }),
-        ("///", CommentKind { shape: CommentShape::Line, doc: Some(CommentPlacement::Outer) }),
-        ("//!", CommentKind { shape: CommentShape::Line, doc: Some(CommentPlacement::Inner) }),
-        ("/**", CommentKind { shape: CommentShape::Block, doc: Some(CommentPlacement::Outer) }),
-        ("/*!", CommentKind { shape: CommentShape::Block, doc: Some(CommentPlacement::Inner) }),
-        ("//", CommentKind { shape: CommentShape::Line, doc: None }),
-        ("/*", CommentKind { shape: CommentShape::Block, doc: None }),
-    ];
+impl AstToken for AnyComment {
+    fn can_cast(kind: SyntaxKind) -> bool
+    where
+        Self: Sized,
+    {
+        matches!(
+            kind,
+            SyntaxKind::COMMENT | SyntaxKind::INNER_DOC_COMMENT | SyntaxKind::OUTER_DOC_COMMENT
+        )
+    }
 
-    pub(crate) fn from_text(text: &str) -> CommentKind {
-        let &(_prefix, kind) = CommentKind::BY_PREFIX
-            .iter()
-            .find(|&(prefix, _kind)| text.starts_with(prefix))
-            .unwrap();
-        kind
+    fn cast(syntax: SyntaxToken) -> Option<Self>
+    where
+        Self: Sized,
+    {
+        if Self::can_cast(syntax.kind()) { Some(Self { syntax }) } else { None }
+    }
+
+    fn syntax(&self) -> &SyntaxToken {
+        &self.syntax
+    }
+}
+
+impl AnyComment {
+    pub fn shape(&self) -> CommentShape {
+        CommentShape::from_text(self.text_with_markers())
+    }
+
+    pub fn doc_kind(&self) -> Option<AttrKind> {
+        match self.syntax.kind() {
+            SyntaxKind::COMMENT => None,
+            SyntaxKind::INNER_DOC_COMMENT => Some(AttrKind::Inner),
+            SyntaxKind::OUTER_DOC_COMMENT => Some(AttrKind::Outer),
+            _ => unreachable!(),
+        }
+    }
+
+    pub fn kind(&self) -> CommentKind {
+        CommentKind { shape: self.shape(), doc: self.doc_kind() }
     }
 
     pub fn prefix(&self) -> &'static str {
-        let &(prefix, _) =
-            CommentKind::BY_PREFIX.iter().rev().find(|(_, kind)| kind == self).unwrap();
-        prefix
+        self.kind().prefix()
+    }
+
+    pub fn is_inner(&self) -> bool {
+        self.doc_kind() == Some(AttrKind::Inner)
+    }
+
+    pub fn is_outer(&self) -> bool {
+        self.doc_kind() == Some(AttrKind::Outer)
+    }
+
+    /// Returns the text with the `/*...*/` or `//...` or `/**...*/` or `/*!...*/` or `///...` or `//!...` markers.
+    pub fn text_with_markers(&self) -> &str {
+        self.syntax.text()
+    }
+
+    /// Returns the textual content of a doc comment node as a single string with prefix and suffix removed.
+    pub fn text(&self) -> &str {
+        let shape = self.shape();
+        let prefix_len = if self.doc_kind().is_some() { 3 } else { 2 };
+        let text = &self.text_with_markers()[prefix_len..];
+        if shape == CommentShape::Block {
+            // The `*/` may not exist because of recovery.
+            text.strip_suffix("*/").unwrap_or(text)
+        } else {
+            text
+        }
     }
 }
 
 impl ast::Whitespace {
     pub fn spans_multiple_lines(&self) -> bool {
         let text = self.text();
-        text.find('\n').map_or(false, |idx| text[idx + 1..].contains('\n'))
+        text.find('\n').is_some_and(|idx| text[idx + 1..].contains('\n'))
     }
 }
 
+#[derive(Debug)]
 pub struct QuoteOffsets {
     pub quotes: (TextRange, TextRange),
     pub contents: TextRange,
@@ -141,6 +185,11 @@ impl QuoteOffsets {
 }
 
 pub trait IsString: AstToken {
+    fn raw_prefix(&self) -> &'static str;
+    fn unescape(&self, s: &str, callback: impl FnMut(Range<usize>, Result<char, EscapeError>));
+    fn is_raw(&self) -> bool {
+        self.text().starts_with(self.raw_prefix())
+    }
     fn quote_offsets(&self) -> Option<QuoteOffsets> {
         let text = self.text();
         let offsets = QuoteOffsets::new(text)?;
@@ -154,462 +203,187 @@ pub trait IsString: AstToken {
     fn text_range_between_quotes(&self) -> Option<TextRange> {
         self.quote_offsets().map(|it| it.contents)
     }
+    fn text_without_quotes(&self) -> &str {
+        let text = self.text();
+        let Some(offsets) = self.text_range_between_quotes() else { return text };
+        &text[offsets - self.syntax().text_range().start()]
+    }
     fn open_quote_text_range(&self) -> Option<TextRange> {
         self.quote_offsets().map(|it| it.quotes.0)
     }
     fn close_quote_text_range(&self) -> Option<TextRange> {
         self.quote_offsets().map(|it| it.quotes.1)
     }
+    fn escaped_char_ranges(&self, cb: &mut dyn FnMut(TextRange, Result<char, EscapeError>)) {
+        let Some(text_range_no_quotes) = self.text_range_between_quotes() else { return };
+
+        let start = self.syntax().text_range().start();
+        let text = &self.text()[text_range_no_quotes - start];
+        let offset = text_range_no_quotes.start() - start;
+
+        if self.is_raw() {
+            let mut pos = offset;
+            for c in text.chars() {
+                let len = TextSize::of(c);
+                cb(TextRange::at(pos, len), Ok(c));
+                pos += len;
+            }
+            return;
+        }
+
+        self.unescape(text, &mut |range: Range<usize>, unescaped_char| {
+            if let Some((s, e)) = range.start.try_into().ok().zip(range.end.try_into().ok()) {
+                cb(TextRange::new(s, e) + offset, unescaped_char);
+            }
+        });
+    }
+    fn map_range_up(&self, range: TextRange) -> Option<TextRange> {
+        let contents_range = self.text_range_between_quotes()?;
+        if always!(TextRange::up_to(contents_range.len()).contains_range(range)) {
+            Some(range + contents_range.start())
+        } else {
+            None
+        }
+    }
+    fn map_offset_down(&self, offset: TextSize) -> Option<TextSize> {
+        let contents_range = self.text_range_between_quotes()?;
+        offset.checked_sub(contents_range.start())
+    }
 }
 
-impl IsString for ast::String {}
+impl IsString for ast::String {
+    fn raw_prefix(&self) -> &'static str {
+        "r"
+    }
+    fn unescape(&self, s: &str, cb: impl FnMut(Range<usize>, Result<char, EscapeError>)) {
+        unescape_str(s, cb)
+    }
+}
 
 impl ast::String {
-    pub fn is_raw(&self) -> bool {
-        self.text().starts_with('r')
-    }
-    pub fn map_range_up(&self, range: TextRange) -> Option<TextRange> {
-        let contents_range = self.text_range_between_quotes()?;
-        assert!(TextRange::up_to(contents_range.len()).contains_range(range));
-        Some(range + contents_range.start())
-    }
-
-    pub fn value(&self) -> Option<Cow<'_, str>> {
-        if self.is_raw() {
-            let text = self.text();
-            let text =
-                &text[self.text_range_between_quotes()? - self.syntax().text_range().start()];
-            return Some(Cow::Borrowed(text));
-        }
-
+    pub fn value(&self) -> Result<Cow<'_, str>, EscapeError> {
         let text = self.text();
-        let text = &text[self.text_range_between_quotes()? - self.syntax().text_range().start()];
+        let text_range = self.text_range_between_quotes().ok_or(EscapeError::LoneSlash)?;
+        let text = &text[text_range - self.syntax().text_range().start()];
+        if self.is_raw() {
+            return Ok(Cow::Borrowed(text));
+        }
 
         let mut buf = String::new();
-        let mut text_iter = text.chars();
-        let mut has_error = false;
-        unescape_literal(text, Mode::Str, &mut |char_range, unescaped_char| match (
-            unescaped_char,
-            buf.capacity() == 0,
-        ) {
-            (Ok(c), false) => buf.push(c),
-            (Ok(c), true) if char_range.len() == 1 && Some(c) == text_iter.next() => (),
-            (Ok(c), true) => {
-                buf.reserve_exact(text.len());
-                buf.push_str(&text[..char_range.start]);
-                buf.push(c);
+        let mut prev_end = 0;
+        let mut has_error = None;
+        unescape_str(text, |char_range, unescaped_char| {
+            match (unescaped_char, buf.capacity() == 0) {
+                (Ok(c), false) => buf.push(c),
+                (Ok(_), true) if char_range.len() == 1 && char_range.start == prev_end => {
+                    prev_end = char_range.end
+                }
+                (Ok(c), true) => {
+                    buf.reserve_exact(text.len());
+                    buf.push_str(&text[..prev_end]);
+                    buf.push(c);
+                }
+                (Err(e), _) => has_error = Some(e),
             }
-            (Err(_), _) => has_error = true,
         });
 
         match (has_error, buf.capacity() == 0) {
-            (true, _) => None,
-            (false, true) => Some(Cow::Borrowed(text)),
-            (false, false) => Some(Cow::Owned(buf)),
+            (Some(e), _) => Err(e),
+            (None, true) => Ok(Cow::Borrowed(text)),
+            (None, false) => Ok(Cow::Owned(buf)),
         }
     }
 }
 
-impl IsString for ast::ByteString {}
+impl IsString for ast::ByteString {
+    fn raw_prefix(&self) -> &'static str {
+        "br"
+    }
+    fn unescape(&self, s: &str, mut callback: impl FnMut(Range<usize>, Result<char, EscapeError>)) {
+        unescape_byte_str(s, |range, res| callback(range, res.map(char::from)))
+    }
+}
 
 impl ast::ByteString {
-    pub fn is_raw(&self) -> bool {
-        self.text().starts_with("br")
-    }
-
-    pub fn value(&self) -> Option<Cow<'_, [u8]>> {
+    pub fn value(&self) -> Result<Cow<'_, [u8]>, EscapeError> {
+        let text = self.text();
+        let text_range = self.text_range_between_quotes().ok_or(EscapeError::LoneSlash)?;
+        let text = &text[text_range - self.syntax().text_range().start()];
         if self.is_raw() {
-            let text = self.text();
-            let text =
-                &text[self.text_range_between_quotes()? - self.syntax().text_range().start()];
-            return Some(Cow::Borrowed(text.as_bytes()));
+            return Ok(Cow::Borrowed(text.as_bytes()));
         }
 
-        let text = self.text();
-        let text = &text[self.text_range_between_quotes()? - self.syntax().text_range().start()];
-
         let mut buf: Vec<u8> = Vec::new();
-        let mut text_iter = text.chars();
-        let mut has_error = false;
-        unescape_literal(text, Mode::ByteStr, &mut |char_range, unescaped_char| match (
-            unescaped_char,
-            buf.capacity() == 0,
-        ) {
-            (Ok(c), false) => buf.push(c as u8),
-            (Ok(c), true) if char_range.len() == 1 && Some(c) == text_iter.next() => (),
-            (Ok(c), true) => {
-                buf.reserve_exact(text.len());
-                buf.extend_from_slice(text[..char_range.start].as_bytes());
-                buf.push(c as u8);
+        let mut prev_end = 0;
+        let mut has_error = None;
+        unescape_byte_str(text, |char_range, unescaped_byte| {
+            match (unescaped_byte, buf.capacity() == 0) {
+                (Ok(b), false) => buf.push(b),
+                (Ok(_), true) if char_range.len() == 1 && char_range.start == prev_end => {
+                    prev_end = char_range.end
+                }
+                (Ok(b), true) => {
+                    buf.reserve_exact(text.len());
+                    buf.extend_from_slice(&text.as_bytes()[..prev_end]);
+                    buf.push(b);
+                }
+                (Err(e), _) => has_error = Some(e),
             }
-            (Err(_), _) => has_error = true,
         });
 
         match (has_error, buf.capacity() == 0) {
-            (true, _) => None,
-            (false, true) => Some(Cow::Borrowed(text.as_bytes())),
-            (false, false) => Some(Cow::Owned(buf)),
+            (Some(e), _) => Err(e),
+            (None, true) => Ok(Cow::Borrowed(&text.as_bytes()[..prev_end])),
+            (None, false) => Ok(Cow::Owned(buf)),
         }
     }
 }
 
-#[derive(Debug)]
-pub enum FormatSpecifier {
-    Open,
-    Close,
-    Integer,
-    Identifier,
-    Colon,
-    Fill,
-    Align,
-    Sign,
-    NumberSign,
-    Zero,
-    DollarSign,
-    Dot,
-    Asterisk,
-    QuestionMark,
-}
-
-pub trait HasFormatSpecifier: AstToken {
-    fn char_ranges(
-        &self,
-    ) -> Option<Vec<(TextRange, Result<char, rustc_lexer::unescape::EscapeError>)>>;
-
-    fn lex_format_specifier<F>(&self, mut callback: F)
-    where
-        F: FnMut(TextRange, FormatSpecifier),
-    {
-        let char_ranges = match self.char_ranges() {
-            Some(char_ranges) => char_ranges,
-            None => return,
-        };
-        let mut chars = char_ranges.iter().peekable();
-
-        while let Some((range, first_char)) = chars.next() {
-            match first_char {
-                Ok('{') => {
-                    // Format specifier, see syntax at https://doc.rust-lang.org/std/fmt/index.html#syntax
-                    if let Some((_, Ok('{'))) = chars.peek() {
-                        // Escaped format specifier, `{{`
-                        chars.next();
-                        continue;
-                    }
-
-                    callback(*range, FormatSpecifier::Open);
-
-                    // check for integer/identifier
-                    match chars
-                        .peek()
-                        .and_then(|next| next.1.as_ref().ok())
-                        .copied()
-                        .unwrap_or_default()
-                    {
-                        '0'..='9' => {
-                            // integer
-                            read_integer(&mut chars, &mut callback);
-                        }
-                        c if c == '_' || c.is_alphabetic() => {
-                            // identifier
-                            read_identifier(&mut chars, &mut callback);
-                        }
-                        _ => {}
-                    }
-
-                    if let Some((_, Ok(':'))) = chars.peek() {
-                        skip_char_and_emit(&mut chars, FormatSpecifier::Colon, &mut callback);
-
-                        // check for fill/align
-                        let mut cloned = chars.clone().take(2);
-                        let first = cloned
-                            .next()
-                            .and_then(|next| next.1.as_ref().ok())
-                            .copied()
-                            .unwrap_or_default();
-                        let second = cloned
-                            .next()
-                            .and_then(|next| next.1.as_ref().ok())
-                            .copied()
-                            .unwrap_or_default();
-                        match second {
-                            '<' | '^' | '>' => {
-                                // alignment specifier, first char specifies fillment
-                                skip_char_and_emit(
-                                    &mut chars,
-                                    FormatSpecifier::Fill,
-                                    &mut callback,
-                                );
-                                skip_char_and_emit(
-                                    &mut chars,
-                                    FormatSpecifier::Align,
-                                    &mut callback,
-                                );
-                            }
-                            _ => match first {
-                                '<' | '^' | '>' => {
-                                    skip_char_and_emit(
-                                        &mut chars,
-                                        FormatSpecifier::Align,
-                                        &mut callback,
-                                    );
-                                }
-                                _ => {}
-                            },
-                        }
-
-                        // check for sign
-                        match chars
-                            .peek()
-                            .and_then(|next| next.1.as_ref().ok())
-                            .copied()
-                            .unwrap_or_default()
-                        {
-                            '+' | '-' => {
-                                skip_char_and_emit(
-                                    &mut chars,
-                                    FormatSpecifier::Sign,
-                                    &mut callback,
-                                );
-                            }
-                            _ => {}
-                        }
-
-                        // check for `#`
-                        if let Some((_, Ok('#'))) = chars.peek() {
-                            skip_char_and_emit(
-                                &mut chars,
-                                FormatSpecifier::NumberSign,
-                                &mut callback,
-                            );
-                        }
-
-                        // check for `0`
-                        let mut cloned = chars.clone().take(2);
-                        let first = cloned.next().and_then(|next| next.1.as_ref().ok()).copied();
-                        let second = cloned.next().and_then(|next| next.1.as_ref().ok()).copied();
-
-                        if first == Some('0') && second != Some('$') {
-                            skip_char_and_emit(&mut chars, FormatSpecifier::Zero, &mut callback);
-                        }
-
-                        // width
-                        match chars
-                            .peek()
-                            .and_then(|next| next.1.as_ref().ok())
-                            .copied()
-                            .unwrap_or_default()
-                        {
-                            '0'..='9' => {
-                                read_integer(&mut chars, &mut callback);
-                                if let Some((_, Ok('$'))) = chars.peek() {
-                                    skip_char_and_emit(
-                                        &mut chars,
-                                        FormatSpecifier::DollarSign,
-                                        &mut callback,
-                                    );
-                                }
-                            }
-                            c if c == '_' || c.is_alphabetic() => {
-                                read_identifier(&mut chars, &mut callback);
-
-                                if chars.peek().and_then(|next| next.1.as_ref().ok()).copied()
-                                    == Some('?')
-                                {
-                                    skip_char_and_emit(
-                                        &mut chars,
-                                        FormatSpecifier::QuestionMark,
-                                        &mut callback,
-                                    );
-                                }
-
-                                // can be either width (indicated by dollar sign, or type in which case
-                                // the next sign has to be `}`)
-                                let next =
-                                    chars.peek().and_then(|next| next.1.as_ref().ok()).copied();
-
-                                match next {
-                                    Some('$') => skip_char_and_emit(
-                                        &mut chars,
-                                        FormatSpecifier::DollarSign,
-                                        &mut callback,
-                                    ),
-                                    Some('}') => {
-                                        skip_char_and_emit(
-                                            &mut chars,
-                                            FormatSpecifier::Close,
-                                            &mut callback,
-                                        );
-                                        continue;
-                                    }
-                                    _ => continue,
-                                };
-                            }
-                            _ => {}
-                        }
-
-                        // precision
-                        if let Some((_, Ok('.'))) = chars.peek() {
-                            skip_char_and_emit(&mut chars, FormatSpecifier::Dot, &mut callback);
-
-                            match chars
-                                .peek()
-                                .and_then(|next| next.1.as_ref().ok())
-                                .copied()
-                                .unwrap_or_default()
-                            {
-                                '*' => {
-                                    skip_char_and_emit(
-                                        &mut chars,
-                                        FormatSpecifier::Asterisk,
-                                        &mut callback,
-                                    );
-                                }
-                                '0'..='9' => {
-                                    read_integer(&mut chars, &mut callback);
-                                    if let Some((_, Ok('$'))) = chars.peek() {
-                                        skip_char_and_emit(
-                                            &mut chars,
-                                            FormatSpecifier::DollarSign,
-                                            &mut callback,
-                                        );
-                                    }
-                                }
-                                c if c == '_' || c.is_alphabetic() => {
-                                    read_identifier(&mut chars, &mut callback);
-                                    if chars.peek().and_then(|next| next.1.as_ref().ok()).copied()
-                                        != Some('$')
-                                    {
-                                        continue;
-                                    }
-                                    skip_char_and_emit(
-                                        &mut chars,
-                                        FormatSpecifier::DollarSign,
-                                        &mut callback,
-                                    );
-                                }
-                                _ => {
-                                    continue;
-                                }
-                            }
-                        }
-
-                        // type
-                        match chars
-                            .peek()
-                            .and_then(|next| next.1.as_ref().ok())
-                            .copied()
-                            .unwrap_or_default()
-                        {
-                            '?' => {
-                                skip_char_and_emit(
-                                    &mut chars,
-                                    FormatSpecifier::QuestionMark,
-                                    &mut callback,
-                                );
-                            }
-                            c if c == '_' || c.is_alphabetic() => {
-                                read_identifier(&mut chars, &mut callback);
-
-                                if chars.peek().and_then(|next| next.1.as_ref().ok()).copied()
-                                    == Some('?')
-                                {
-                                    skip_char_and_emit(
-                                        &mut chars,
-                                        FormatSpecifier::QuestionMark,
-                                        &mut callback,
-                                    );
-                                }
-                            }
-                            _ => {}
-                        }
-                    }
-
-                    match chars.peek() {
-                        Some((_, Ok('}'))) => {
-                            skip_char_and_emit(&mut chars, FormatSpecifier::Close, &mut callback);
-                        }
-                        Some((_, _)) | None => continue,
-                    }
-                }
-                _ => {
-                    while let Some((_, Ok(next_char))) = chars.peek() {
-                        if next_char == &'{' {
-                            break;
-                        }
-                        chars.next();
-                    }
-                }
-            };
-        }
-
-        fn skip_char_and_emit<'a, I, F>(
-            chars: &mut std::iter::Peekable<I>,
-            emit: FormatSpecifier,
-            callback: &mut F,
-        ) where
-            I: Iterator<Item = &'a (TextRange, Result<char, rustc_lexer::unescape::EscapeError>)>,
-            F: FnMut(TextRange, FormatSpecifier),
-        {
-            let (range, _) = chars.next().unwrap();
-            callback(*range, emit);
-        }
-
-        fn read_integer<'a, I, F>(chars: &mut std::iter::Peekable<I>, callback: &mut F)
-        where
-            I: Iterator<Item = &'a (TextRange, Result<char, rustc_lexer::unescape::EscapeError>)>,
-            F: FnMut(TextRange, FormatSpecifier),
-        {
-            let (mut range, c) = chars.next().unwrap();
-            assert!(c.as_ref().unwrap().is_ascii_digit());
-            while let Some((r, Ok(next_char))) = chars.peek() {
-                if next_char.is_ascii_digit() {
-                    chars.next();
-                    range = range.cover(*r);
-                } else {
-                    break;
-                }
-            }
-            callback(range, FormatSpecifier::Integer);
-        }
-
-        fn read_identifier<'a, I, F>(chars: &mut std::iter::Peekable<I>, callback: &mut F)
-        where
-            I: Iterator<Item = &'a (TextRange, Result<char, rustc_lexer::unescape::EscapeError>)>,
-            F: FnMut(TextRange, FormatSpecifier),
-        {
-            let (mut range, c) = chars.next().unwrap();
-            assert!(c.as_ref().unwrap().is_alphabetic() || *c.as_ref().unwrap() == '_');
-            while let Some((r, Ok(next_char))) = chars.peek() {
-                if *next_char == '_' || next_char.is_ascii_digit() || next_char.is_alphabetic() {
-                    chars.next();
-                    range = range.cover(*r);
-                } else {
-                    break;
-                }
-            }
-            callback(range, FormatSpecifier::Identifier);
-        }
+impl IsString for ast::CString {
+    fn raw_prefix(&self) -> &'static str {
+        "cr"
+    }
+    // NOTE: This method should only be used for highlighting ranges. The unescaped
+    // char/byte is not used. For simplicity, we return an arbitrary placeholder char.
+    fn unescape(&self, s: &str, mut callback: impl FnMut(Range<usize>, Result<char, EscapeError>)) {
+        unescape_c_str(s, |range, _res| callback(range, Ok('_')))
     }
 }
 
-impl HasFormatSpecifier for ast::String {
-    fn char_ranges(
-        &self,
-    ) -> Option<Vec<(TextRange, Result<char, rustc_lexer::unescape::EscapeError>)>> {
+impl ast::CString {
+    pub fn value(&self) -> Result<Cow<'_, [u8]>, EscapeError> {
         let text = self.text();
-        let text = &text[self.text_range_between_quotes()? - self.syntax().text_range().start()];
-        let offset = self.text_range_between_quotes()?.start() - self.syntax().text_range().start();
+        let text_range = self.text_range_between_quotes().ok_or(EscapeError::LoneSlash)?;
+        let text = &text[text_range - self.syntax().text_range().start()];
+        if self.is_raw() {
+            return Ok(Cow::Borrowed(text.as_bytes()));
+        }
 
-        let mut res = Vec::with_capacity(text.len());
-        unescape_literal(text, Mode::Str, &mut |range, unescaped_char| {
-            res.push((
-                TextRange::new(range.start.try_into().unwrap(), range.end.try_into().unwrap())
-                    + offset,
-                unescaped_char,
-            ));
+        let mut buf = Vec::new();
+        let mut prev_end = 0;
+        let mut has_error = None;
+        let extend_unit = |buf: &mut Vec<u8>, unit: MixedUnit| match unit {
+            MixedUnit::Char(c) => buf.extend(c.get().encode_utf8(&mut [0; 4]).as_bytes()),
+            MixedUnit::HighByte(b) => buf.push(b.get()),
+        };
+        unescape_c_str(text, |char_range, unescaped| match (unescaped, buf.capacity() == 0) {
+            (Ok(u), false) => extend_unit(&mut buf, u),
+            (Ok(_), true) if char_range.len() == 1 && char_range.start == prev_end => {
+                prev_end = char_range.end
+            }
+            (Ok(u), true) => {
+                buf.reserve_exact(text.len());
+                buf.extend(&text.as_bytes()[..prev_end]);
+                extend_unit(&mut buf, u);
+            }
+            (Err(e), _) => has_error = Some(e),
         });
 
-        Some(res)
+        match (has_error, buf.capacity() == 0) {
+            (Some(e), _) => Err(e),
+            (None, true) => Ok(Cow::Borrowed(text.as_bytes())),
+            (None, false) => Ok(Cow::Owned(buf)),
+        }
     }
 }
 
@@ -623,53 +397,73 @@ impl ast::IntNumber {
         }
     }
 
-    pub fn value(&self) -> Option<u128> {
-        let token = self.syntax();
-
-        let mut text = token.text();
-        if let Some(suffix) = self.suffix() {
-            text = &text[..text.len() - suffix.len()];
-        }
-
+    pub fn split_into_parts(&self) -> (&str, &str, &str) {
         let radix = self.radix();
-        text = &text[radix.prefix_len()..];
+        let (prefix, mut text) = self.text().split_at(radix.prefix_len());
 
-        let buf;
-        if text.contains('_') {
-            buf = text.replace('_', "");
-            text = buf.as_str();
-        };
-
-        let value = u128::from_str_radix(text, radix as u32).ok()?;
-        Some(value)
-    }
-
-    pub fn suffix(&self) -> Option<&str> {
-        let text = self.text();
-        let radix = self.radix();
-        let mut indices = text.char_indices();
-        if radix != Radix::Decimal {
-            indices.next()?;
-            indices.next()?;
-        }
         let is_suffix_start: fn(&(usize, char)) -> bool = match radix {
             Radix::Hexadecimal => |(_, c)| matches!(c, 'g'..='z' | 'G'..='Z'),
             _ => |(_, c)| c.is_ascii_alphabetic(),
         };
-        let (suffix_start, _) = indices.find(is_suffix_start)?;
-        Some(&text[suffix_start..])
+
+        let mut suffix = "";
+        if let Some((suffix_start, _)) = text.char_indices().find(is_suffix_start) {
+            let (text2, suffix2) = text.split_at(suffix_start);
+            text = text2;
+            suffix = suffix2;
+        };
+
+        (prefix, text, suffix)
+    }
+
+    pub fn value(&self) -> Result<u128, ParseIntError> {
+        let (_, text, _) = self.split_into_parts();
+        u128::from_str_radix(&text.replace('_', ""), self.radix() as u32)
+    }
+
+    pub fn suffix(&self) -> Option<&str> {
+        let (_, _, suffix) = self.split_into_parts();
+        if suffix.is_empty() { None } else { Some(suffix) }
+    }
+
+    pub fn value_string(&self) -> String {
+        let (_, text, _) = self.split_into_parts();
+        text.replace('_', "")
     }
 }
 
 impl ast::FloatNumber {
-    pub fn suffix(&self) -> Option<&str> {
+    pub fn split_into_parts(&self) -> (&str, &str) {
         let text = self.text();
+        let mut float_text = self.text();
+        let mut suffix = "";
         let mut indices = text.char_indices();
-        let (mut suffix_start, c) = indices.by_ref().find(|(_, c)| c.is_ascii_alphabetic())?;
-        if c == 'e' || c == 'E' {
-            suffix_start = indices.find(|(_, c)| c.is_ascii_alphabetic())?.0;
+        if let Some((mut suffix_start, c)) = indices.by_ref().find(|(_, c)| c.is_ascii_alphabetic())
+        {
+            if c == 'e' || c == 'E' {
+                if let Some(suffix_start_tuple) = indices.find(|(_, c)| c.is_ascii_alphabetic()) {
+                    suffix_start = suffix_start_tuple.0;
+
+                    float_text = &text[..suffix_start];
+                    suffix = &text[suffix_start..];
+                }
+            } else {
+                float_text = &text[..suffix_start];
+                suffix = &text[suffix_start..];
+            }
         }
-        Some(&text[suffix_start..])
+
+        (float_text, suffix)
+    }
+
+    pub fn suffix(&self) -> Option<&str> {
+        let (_, suffix) = self.split_into_parts();
+        if suffix.is_empty() { None } else { Some(suffix) }
+    }
+
+    pub fn value_string(&self) -> String {
+        let (text, _) = self.split_into_parts();
+        text.replace('_', "")
     }
 }
 
@@ -693,9 +487,111 @@ impl Radix {
     }
 }
 
+impl ast::Char {
+    pub fn value(&self) -> Result<char, EscapeError> {
+        let mut text = self.text();
+        if text.starts_with('\'') {
+            text = &text[1..];
+        } else {
+            return Err(EscapeError::ZeroChars);
+        }
+        if text.ends_with('\'') {
+            text = &text[0..text.len() - 1];
+        }
+
+        unescape_char(text)
+    }
+}
+
+impl ast::Byte {
+    pub fn value(&self) -> Result<u8, EscapeError> {
+        let mut text = self.text();
+        if text.starts_with("b\'") {
+            text = &text[2..];
+        } else {
+            return Err(EscapeError::ZeroChars);
+        }
+        if text.ends_with('\'') {
+            text = &text[0..text.len() - 1];
+        }
+
+        unescape_byte(text)
+    }
+}
+
+pub enum AnyString {
+    ByteString(ast::ByteString),
+    CString(ast::CString),
+    String(ast::String),
+}
+
+impl AnyString {
+    pub fn value(&self) -> Result<Cow<'_, str>, EscapeError> {
+        fn from_utf8(s: Cow<'_, [u8]>) -> Result<Cow<'_, str>, EscapeError> {
+            match s {
+                Cow::Borrowed(s) => str::from_utf8(s)
+                    .map_err(|_| EscapeError::NonAsciiCharInByte)
+                    .map(Cow::Borrowed),
+                Cow::Owned(s) => String::from_utf8(s)
+                    .map_err(|_| EscapeError::NonAsciiCharInByte)
+                    .map(Cow::Owned),
+            }
+        }
+
+        match self {
+            AnyString::String(s) => s.value(),
+            AnyString::ByteString(s) => s.value().and_then(from_utf8),
+            AnyString::CString(s) => s.value().and_then(from_utf8),
+        }
+    }
+}
+
+impl ast::AstToken for AnyString {
+    fn can_cast(kind: crate::SyntaxKind) -> bool {
+        ast::String::can_cast(kind)
+            || ast::ByteString::can_cast(kind)
+            || ast::CString::can_cast(kind)
+    }
+
+    fn cast(syntax: crate::SyntaxToken) -> Option<Self> {
+        ast::String::cast(syntax.clone())
+            .map(Self::String)
+            .or_else(|| ast::ByteString::cast(syntax.clone()).map(Self::ByteString))
+            .or_else(|| ast::CString::cast(syntax).map(Self::CString))
+    }
+
+    fn syntax(&self) -> &crate::SyntaxToken {
+        match self {
+            Self::ByteString(it) => it.syntax(),
+            Self::CString(it) => it.syntax(),
+            Self::String(it) => it.syntax(),
+        }
+    }
+}
+
+impl IsString for AnyString {
+    fn raw_prefix(&self) -> &'static str {
+        match self {
+            AnyString::ByteString(s) => s.raw_prefix(),
+            AnyString::CString(s) => s.raw_prefix(),
+            AnyString::String(s) => s.raw_prefix(),
+        }
+    }
+
+    fn unescape(&self, s: &str, callback: impl FnMut(Range<usize>, Result<char, EscapeError>)) {
+        match self {
+            AnyString::ByteString(it) => it.unescape(s, callback),
+            AnyString::CString(it) => it.unescape(s, callback),
+            AnyString::String(it) => it.unescape(s, callback),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use crate::ast::{self, make, FloatNumber, IntNumber};
+    use rustc_apfloat::ieee::Quad as f128;
+
+    use crate::ast::{self, FloatNumber, IntNumber, make};
 
     fn check_float_suffix<'a>(lit: &str, expected: impl Into<Option<&'a str>>) {
         assert_eq!(FloatNumber { syntax: make::tokens::literal(lit) }.suffix(), expected.into());
@@ -705,15 +601,32 @@ mod tests {
         assert_eq!(IntNumber { syntax: make::tokens::literal(lit) }.suffix(), expected.into());
     }
 
+    // FIXME(#17451) Use `expected: f128` once `f128` is stabilised.
+    fn check_float_value(lit: &str, expected: &str) {
+        let expected = Some(expected.parse::<f128>().unwrap());
+        assert_eq!(
+            FloatNumber { syntax: make::tokens::literal(lit) }.value_string().parse::<f128>().ok(),
+            expected
+        );
+        assert_eq!(
+            IntNumber { syntax: make::tokens::literal(lit) }.value_string().parse::<f128>().ok(),
+            expected
+        );
+    }
+
+    fn check_int_value(lit: &str, expected: impl Into<Option<u128>>) {
+        assert_eq!(IntNumber { syntax: make::tokens::literal(lit) }.value().ok(), expected.into());
+    }
+
     #[test]
     fn test_float_number_suffix() {
         check_float_suffix("123.0", None);
         check_float_suffix("123f32", "f32");
         check_float_suffix("123.0e", None);
         check_float_suffix("123.0e4", None);
-        check_float_suffix("123.0ef32", "f32");
+        check_float_suffix("123.0ef16", "f16");
         check_float_suffix("123.0E4f32", "f32");
-        check_float_suffix("1_2_3.0_f32", "f32");
+        check_float_suffix("1_2_3.0_f128", "f128");
     }
 
     #[test]
@@ -731,9 +644,10 @@ mod tests {
 
     fn check_string_value<'a>(lit: &str, expected: impl Into<Option<&'a str>>) {
         assert_eq!(
-            ast::String { syntax: make::tokens::literal(&format!("\"{}\"", lit)) }
+            ast::String { syntax: make::tokens::literal(&format!("\"{lit}\"")) }
                 .value()
-                .as_deref(),
+                .as_deref()
+                .ok(),
             expected.into()
         );
     }
@@ -744,5 +658,50 @@ mod tests {
         check_string_value(r"\foobar", None);
         check_string_value(r"\nfoobar", "\nfoobar");
         check_string_value(r"C:\\Windows\\System32\\", "C:\\Windows\\System32\\");
+        check_string_value(r"\x61bcde", "abcde");
+        check_string_value(
+            r"a\
+bcde", "abcde",
+        );
+    }
+
+    fn check_byte_string_value<'a, const N: usize>(
+        lit: &str,
+        expected: impl Into<Option<&'a [u8; N]>>,
+    ) {
+        assert_eq!(
+            ast::ByteString { syntax: make::tokens::literal(&format!("b\"{lit}\"")) }
+                .value()
+                .as_deref()
+                .ok(),
+            expected.into().map(|value| &value[..])
+        );
+    }
+
+    #[test]
+    fn test_byte_string_escape() {
+        check_byte_string_value(r"foobar", b"foobar");
+        check_byte_string_value(r"\foobar", None::<&[u8; 0]>);
+        check_byte_string_value(r"\nfoobar", b"\nfoobar");
+        check_byte_string_value(r"C:\\Windows\\System32\\", b"C:\\Windows\\System32\\");
+        check_byte_string_value(r"\x61bcde", b"abcde");
+        check_byte_string_value(
+            r"a\
+bcde", b"abcde",
+        );
+        check_byte_string_value(
+            r"\
+    ", b"",
+        );
+    }
+
+    #[test]
+    fn test_value_underscores() {
+        check_float_value("1.3_4665449586950493453___6_f128", "1.346654495869504934536");
+        check_float_value("1.234567891011121_f64", "1.234567891011121");
+        check_float_value("1__0.__0__f32", "10.0");
+        check_float_value("3._0_f16", "3.0");
+        check_int_value("0b__1_0_", 2);
+        check_int_value("1_1_1_1_1_1", 111111);
     }
 }

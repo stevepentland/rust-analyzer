@@ -1,14 +1,16 @@
 [package]
 name = "rust-analyzer"
 version = "0.0.0"
-authors = ["rust-analyzer Team"]
-homepage = "https://github.com/rust-analyzer/rust-analyzer"
+homepage = "https://rust-analyzer.github.io/"
+repository.workspace = true
 description = "A language server for the Rust programming language"
-documentation = "https://rust-analyzer.github.io/manual.html"
-license = "MIT OR Apache-2.0"
+documentation = "https://rust-analyzer.github.io/book/"
 autobins = false
-edition = "2021"
-rust-version = "1.56"
+
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
 
 [lib]
 doctest = false
@@ -18,68 +20,98 @@ name = "rust-analyzer"
 path = "src/bin/main.rs"
 
 [dependencies]
-anyhow = "1.0.26"
-crossbeam-channel = "0.5.0"
-dissimilar = "1.0.2"
-itertools = "0.10.0"
-jod-thread = "0.1.0"
-lsp-types = { version = "0.91", features = ["proposed"] }
-parking_lot = "0.11.0"
-xflags = "0.2.1"
-oorandom = "11.1.2"
-rustc-hash = "1.1.0"
-serde = { version = "1.0.106", features = ["derive"] }
-serde_json = { version = "1.0.48", features = ["preserve_order"] }
-threadpool = "1.7.1"
-rayon = "1.5"
-mimalloc = { version = "0.1.19", default-features = false, optional = true }
-lsp-server = "0.5.1"
-tracing = "0.1"
-tracing-subscriber = { version = "0.2", default-features = false, features = [
-    "env-filter",
-    "registry",
-    "fmt",
-    "tracing-log",
-] }
-tracing-log = "0.1.2"
-tracing-tree = { version = "0.1.10" }
-always-assert = "0.1"
+anyhow.workspace = true
+base64 = "0.22"
+crossbeam-channel.workspace = true
+dirs = "6.0.0"
+dissimilar.workspace = true
+ide-completion.workspace = true
+indexmap.workspace = true
+itertools.workspace = true
+scip = "0.7.1"
+lsp-types = { version = "0.11.0", package = "gen-lsp-types", features = ["url"] }
+parking_lot = "0.12.4"
+xflags = "0.3.2"
+oorandom = "11.1.5"
+rayon.workspace = true
+rustc-hash.workspace = true
+serde_json = { workspace = true, features = ["preserve_order"] }
+serde.workspace = true
+serde_derive.workspace = true
+tenthash = "1.1.0"
+num_cpus = "1.17.0"
+mimalloc = { version = "0.1.46", default-features = false, optional = true }
+lsp-server.workspace = true
+smallvec.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tracing-tree.workspace = true
+triomphe.workspace = true
+toml.workspace = true
+walkdir = "2.5.0"
+semver.workspace = true
+memchr = "2.7.5"
+cargo_metadata.workspace = true
+process-wrap.workspace = true
+dhat = { version = "0.3.3", optional = true }
 
-stdx = { path = "../stdx", version = "0.0.0" }
-flycheck = { path = "../flycheck", version = "0.0.0" }
-ide = { path = "../ide", version = "0.0.0" }
-ide_db = { path = "../ide_db", version = "0.0.0" }
-profile = { path = "../profile", version = "0.0.0" }
-project_model = { path = "../project_model", version = "0.0.0" }
-syntax = { path = "../syntax", version = "0.0.0" }
-vfs = { path = "../vfs", version = "0.0.0" }
-vfs-notify = { path = "../vfs-notify", version = "0.0.0" }
-cfg = { path = "../cfg", version = "0.0.0" }
-toolchain = { path = "../toolchain", version = "0.0.0" }
-tt = { path = "../tt", version = "0.0.0" }
-proc_macro_api = { path = "../proc_macro_api", version = "0.0.0" }
-
+cfg.workspace = true
+hir-def.workspace = true
+hir-ty.workspace = true
+hir.workspace = true
+ide-db.workspace = true
 # This should only be used in CLI
-ide_ssr = { path = "../ide_ssr", version = "0.0.0" }
-hir = { path = "../hir", version = "0.0.0" }
-hir_def = { path = "../hir_def", version = "0.0.0" }
-hir_ty = { path = "../hir_ty", version = "0.0.0" }
-proc_macro_srv = { path = "../proc_macro_srv", version = "0.0.0" }
+ide-ssr.workspace = true
+ide.workspace = true
+load-cargo.workspace = true
+proc-macro-api.workspace = true
+profile.workspace = true
+project-model.workspace = true
+stdx.workspace = true
+syntax.workspace = true
+parser.workspace = true
+toolchain.workspace = true
+vfs-notify.workspace = true
+vfs.workspace = true
+paths.workspace = true
+
+ra-ap-rustc_type_ir.workspace = true
 
 [target.'cfg(windows)'.dependencies]
-winapi = "0.3.8"
+windows-sys = { version = "0.61", features = [
+  "Win32_System_Diagnostics_Debug",
+  "Win32_System_Threading",
+] }
 
 [target.'cfg(not(target_env = "msvc"))'.dependencies]
-jemallocator = { version = "0.4.1", package = "tikv-jemallocator", optional = true }
+jemallocator = { version = "0.7.0", package = "tikv-jemallocator", features = ["stats"], optional = true }
 
 [dev-dependencies]
-expect-test = "1.2.0-pre.1"
-xshell = "0.1"
+expect-test = "1.5.1"
+xshell.workspace = true
 
-test_utils = { path = "../test_utils" }
-sourcegen = { path = "../sourcegen" }
-mbe = { path = "../mbe" }
+test-utils.workspace = true
+test-fixture.workspace = true
+syntax-bridge.workspace = true
+
+intern = { path = "../intern", features = ["prevent-gc"] }
 
 [features]
 jemalloc = ["jemallocator", "profile/jemalloc"]
-force-always-assert = ["always-assert/force"]
+force-always-assert = ["stdx/force-always-assert"]
+in-rust-tree = [
+  "cfg/in-rust-tree",
+  "hir-def/in-rust-tree",
+  "hir-ty/in-rust-tree",
+  "hir/in-rust-tree",
+  "ide-ssr/in-rust-tree",
+  "ide/in-rust-tree",
+  "load-cargo/in-rust-tree",
+  "parser/in-rust-tree",
+  "proc-macro-api/in-rust-tree",
+  "syntax/in-rust-tree",
+]
+dhat = ["dep:dhat"]
+
+[lints]
+workspace = true

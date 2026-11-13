@@ -1,52 +1,146 @@
-import * as assert from 'assert';
-import { Cargo } from '../../src/toolchain';
+import * as assert from "assert";
+import * as os from "os";
+import * as path from "path";
+import { mkdtemp, mkdir, rm, writeFile } from "fs/promises";
+import { Cargo, cargoPath } from "../../src/toolchain";
+import { isWindows, normalizeDriveLetter } from "../../src/util";
+import type { Context } from ".";
 
-suite('Launch configuration', () => {
+export async function getTests(ctx: Context) {
+    await ctx.suite("Launch configuration/Lens", (suite) => {
+        suite.addTest("A binary", async () => {
+            const args = Cargo.artifactSpec([
+                "build",
+                "--package",
+                "pkg_name",
+                "--bin",
+                "pkg_name",
+            ]);
 
-    suite('Lens', () => {
-        test('A binary', async () => {
-            const args = Cargo.artifactSpec(["build", "--package", "pkg_name", "--bin", "pkg_name"]);
-
-            assert.deepEqual(args.cargoArgs, ["build", "--package", "pkg_name", "--bin", "pkg_name", "--message-format=json"]);
-            assert.deepEqual(args.filter, undefined);
+            assert.deepStrictEqual(args.cargoArgs, [
+                "build",
+                "--package",
+                "pkg_name",
+                "--bin",
+                "pkg_name",
+                "--message-format=json",
+            ]);
+            assert.deepStrictEqual(args.filter, undefined);
         });
 
-        test('One of Multiple Binaries', async () => {
+        suite.addTest("One of Multiple Binaries", async () => {
             const args = Cargo.artifactSpec(["build", "--package", "pkg_name", "--bin", "bin1"]);
 
-            assert.deepEqual(args.cargoArgs, ["build", "--package", "pkg_name", "--bin", "bin1", "--message-format=json"]);
-            assert.deepEqual(args.filter, undefined);
+            assert.deepStrictEqual(args.cargoArgs, [
+                "build",
+                "--package",
+                "pkg_name",
+                "--bin",
+                "bin1",
+                "--message-format=json",
+            ]);
+            assert.deepStrictEqual(args.filter, undefined);
         });
 
-        test('A test', async () => {
+        suite.addTest("A test", async () => {
             const args = Cargo.artifactSpec(["test", "--package", "pkg_name", "--lib", "--no-run"]);
 
-            assert.deepEqual(args.cargoArgs, ["test", "--package", "pkg_name", "--lib", "--no-run", "--message-format=json"]);
-            assert.notDeepEqual(args.filter, undefined);
+            assert.deepStrictEqual(args.cargoArgs, [
+                "test",
+                "--package",
+                "pkg_name",
+                "--lib",
+                "--no-run",
+                "--message-format=json",
+            ]);
+            assert.notDeepStrictEqual(args.filter, undefined);
         });
     });
 
-    suite('QuickPick', () => {
-        test('A binary', async () => {
+    await ctx.suite("Launch configuration/QuickPick", (suite) => {
+        suite.addTest("A binary", async () => {
             const args = Cargo.artifactSpec(["run", "--package", "pkg_name", "--bin", "pkg_name"]);
 
-            assert.deepEqual(args.cargoArgs, ["build", "--package", "pkg_name", "--bin", "pkg_name", "--message-format=json"]);
-            assert.deepEqual(args.filter, undefined);
+            assert.deepStrictEqual(args.cargoArgs, [
+                "build",
+                "--package",
+                "pkg_name",
+                "--bin",
+                "pkg_name",
+                "--message-format=json",
+            ]);
+            assert.deepStrictEqual(args.filter, undefined);
         });
 
-
-        test('One of Multiple Binaries', async () => {
+        suite.addTest("One of Multiple Binaries", async () => {
             const args = Cargo.artifactSpec(["run", "--package", "pkg_name", "--bin", "bin2"]);
 
-            assert.deepEqual(args.cargoArgs, ["build", "--package", "pkg_name", "--bin", "bin2", "--message-format=json"]);
-            assert.deepEqual(args.filter, undefined);
+            assert.deepStrictEqual(args.cargoArgs, [
+                "build",
+                "--package",
+                "pkg_name",
+                "--bin",
+                "bin2",
+                "--message-format=json",
+            ]);
+            assert.deepStrictEqual(args.filter, undefined);
         });
 
-        test('A test', async () => {
+        suite.addTest("A test", async () => {
             const args = Cargo.artifactSpec(["test", "--package", "pkg_name", "--lib"]);
 
-            assert.deepEqual(args.cargoArgs, ["test", "--package", "pkg_name", "--lib", "--message-format=json", "--no-run"]);
-            assert.notDeepEqual(args.filter, undefined);
+            assert.deepStrictEqual(args.cargoArgs, [
+                "test",
+                "--package",
+                "pkg_name",
+                "--lib",
+                "--message-format=json",
+                "--no-run",
+            ]);
+            assert.notDeepStrictEqual(args.filter, undefined);
         });
     });
-});
+
+    await ctx.suite("Toolchain resolution", (suite) => {
+        suite.addTest("prefers explicit CARGO from provided env", async () => {
+            const explicitCargo = path.join(os.tmpdir(), "custom-cargo");
+            assert.strictEqual(await cargoPath({ CARGO: explicitCargo }), explicitCargo);
+        });
+
+        suite.addTest("resolves cargo from provided PATH", async () => {
+            const tempDir = await mkdtemp(path.join(os.tmpdir(), "ra-cargo-path-"));
+            try {
+                const cargoBinary = path.join(tempDir, isWindows ? "cargo.exe" : "cargo");
+                await writeFile(cargoBinary, "");
+
+                const pathKey = isWindows ? "Path" : "PATH";
+                assert.strictEqual(await cargoPath({ [pathKey]: tempDir }), "cargo");
+            } finally {
+                await rm(tempDir, { recursive: true, force: true });
+            }
+        });
+
+        suite.addTest("resolves cargo from provided CARGO_HOME", async () => {
+            const cargoHome = await mkdtemp(path.join(os.tmpdir(), "ra-cargo-home-"));
+            try {
+                const binDir = path.join(cargoHome, "bin");
+                await mkdir(binDir);
+                const cargoBinary = path.join(binDir, isWindows ? "cargo.exe" : "cargo");
+                await writeFile(cargoBinary, "");
+
+                assert.strictEqual(
+                    normalizeComparablePath(await cargoPath({ PATH: "", CARGO_HOME: cargoHome })),
+                    normalizeComparablePath(cargoBinary),
+                );
+            } finally {
+                await rm(cargoHome, { recursive: true, force: true });
+            }
+        });
+    });
+}
+
+function normalizeComparablePath(filePath: string): string {
+    // Windows path comparisons should ignore drive-letter casing because `fsPath`
+    // may normalize it differently while still pointing to the same file.
+    return normalizeDriveLetter(filePath, isWindows);
+}

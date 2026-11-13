@@ -3,15 +3,19 @@
 //! These methods should only do simple, shallow tasks related to the syntax of the node itself.
 
 use crate::{
-    ast::{
-        self,
-        operators::{ArithOp, BinaryOp, CmpOp, LogicOp, Ordering, RangeOp, UnaryOp},
-        support, AstChildren, AstNode,
-    },
     AstToken,
-    SyntaxKind::*,
+    SyntaxKind::{self, *},
     SyntaxNode, SyntaxToken, T,
+    ast::{
+        self, ArgList, AstChildren, AstNode, BlockExpr, ClosureExpr, Const, Expr, Fn,
+        FormatArgsArg, FormatArgsExpr, MacroDef, Static, TokenTree,
+        operators::{ArithOp, BinaryOp, CmpOp, LogicOp, Ordering, RangeOp, UnaryOp},
+        support,
+    },
+    match_ast,
 };
+
+use super::RangeItem;
 
 impl ast::HasAttrs for ast::Expr {}
 
@@ -47,25 +51,111 @@ impl From<ast::IfExpr> for ElseBranch {
     }
 }
 
+impl AstNode for ElseBranch {
+    fn can_cast(kind: SyntaxKind) -> bool {
+        ast::BlockExpr::can_cast(kind) || ast::IfExpr::can_cast(kind)
+    }
+
+    fn cast(syntax: SyntaxNode) -> Option<Self> {
+        match_ast!(match syntax {
+            ast::BlockExpr(it) => Some(Self::Block(it)),
+            ast::IfExpr(it) => Some(Self::IfExpr(it)),
+            _ => None,
+        })
+    }
+
+    fn syntax(&self) -> &SyntaxNode {
+        match self {
+            ElseBranch::Block(block_expr) => block_expr.syntax(),
+            ElseBranch::IfExpr(if_expr) => if_expr.syntax(),
+        }
+    }
+}
+
 impl ast::IfExpr {
+    pub fn condition(&self) -> Option<ast::Expr> {
+        // If the condition is a BlockExpr, check if the then body is missing.
+        // If it is assume the condition is the expression that is missing instead.
+        let mut exprs = support::children(self.syntax());
+        let first = exprs.next();
+        match first {
+            Some(ast::Expr::BlockExpr(_)) => exprs.next().and(first),
+            first => first,
+        }
+    }
+
     pub fn then_branch(&self) -> Option<ast::BlockExpr> {
-        self.blocks().next()
+        match support::children(self.syntax()).nth(1)? {
+            ast::Expr::BlockExpr(block) => Some(block),
+            _ => None,
+        }
     }
 
     pub fn else_branch(&self) -> Option<ElseBranch> {
-        let res = match self.blocks().nth(1) {
-            Some(block) => ElseBranch::Block(block),
-            None => {
-                let elif: ast::IfExpr = support::child(self.syntax())?;
-                ElseBranch::IfExpr(elif)
-            }
-        };
-        Some(res)
+        match support::children(self.syntax()).nth(2)? {
+            ast::Expr::BlockExpr(block) => Some(ElseBranch::Block(block)),
+            ast::Expr::IfExpr(elif) => Some(ElseBranch::IfExpr(elif)),
+            _ => None,
+        }
     }
+}
 
-    pub fn blocks(&self) -> AstChildren<ast::BlockExpr> {
-        support::children(self.syntax())
-    }
+#[test]
+fn if_block_condition() {
+    let parse = ast::SourceFile::parse(
+        r#"
+        fn test() {
+            if { true } { "if" }
+            else if { false } { "first elif" }
+            else if true { "second elif" }
+            else if (true) { "third elif" }
+            else { "else" }
+        }
+        "#,
+        parser::Edition::CURRENT,
+    );
+    let if_ = parse.tree().syntax().descendants().find_map(ast::IfExpr::cast).unwrap();
+    assert_eq!(if_.then_branch().unwrap().syntax().text(), r#"{ "if" }"#);
+    let elif = match if_.else_branch().unwrap() {
+        ElseBranch::IfExpr(elif) => elif,
+        ElseBranch::Block(_) => panic!("should be `else if`"),
+    };
+    assert_eq!(elif.then_branch().unwrap().syntax().text(), r#"{ "first elif" }"#);
+    let elif = match elif.else_branch().unwrap() {
+        ElseBranch::IfExpr(elif) => elif,
+        ElseBranch::Block(_) => panic!("should be `else if`"),
+    };
+    assert_eq!(elif.then_branch().unwrap().syntax().text(), r#"{ "second elif" }"#);
+    let elif = match elif.else_branch().unwrap() {
+        ElseBranch::IfExpr(elif) => elif,
+        ElseBranch::Block(_) => panic!("should be `else if`"),
+    };
+    assert_eq!(elif.then_branch().unwrap().syntax().text(), r#"{ "third elif" }"#);
+    let else_ = match elif.else_branch().unwrap() {
+        ElseBranch::Block(else_) => else_,
+        ElseBranch::IfExpr(_) => panic!("should be `else`"),
+    };
+    assert_eq!(else_.syntax().text(), r#"{ "else" }"#);
+}
+
+#[test]
+fn if_condition_with_if_inside() {
+    let parse = ast::SourceFile::parse(
+        r#"
+        fn test() {
+            if if true { true } else { false } { "if" }
+            else { "else" }
+        }
+        "#,
+        parser::Edition::CURRENT,
+    );
+    let if_ = parse.tree().syntax().descendants().find_map(ast::IfExpr::cast).unwrap();
+    assert_eq!(if_.then_branch().unwrap().syntax().text(), r#"{ "if" }"#);
+    let else_ = match if_.else_branch().unwrap() {
+        ElseBranch::Block(else_) => else_,
+        ElseBranch::IfExpr(_) => panic!("should be `else`"),
+    };
+    assert_eq!(else_.syntax().text(), r#"{ "else" }"#);
 }
 
 impl ast::PrefixExpr {
@@ -165,15 +255,15 @@ impl ast::RangeExpr {
         })
     }
 
-    pub fn op_kind(&self) -> Option<RangeOp> {
-        self.op_details().map(|t| t.2)
+    pub fn is_range_full(&self) -> bool {
+        support::children::<Expr>(&self.syntax).next().is_none()
     }
+}
 
-    pub fn op_token(&self) -> Option<SyntaxToken> {
-        self.op_details().map(|t| t.1)
-    }
+impl RangeItem for ast::RangeExpr {
+    type Bound = ast::Expr;
 
-    pub fn start(&self) -> Option<ast::Expr> {
+    fn start(&self) -> Option<ast::Expr> {
         let op_ix = self.op_details()?.0;
         self.syntax()
             .children_with_tokens()
@@ -181,12 +271,20 @@ impl ast::RangeExpr {
             .find_map(|it| ast::Expr::cast(it.into_node()?))
     }
 
-    pub fn end(&self) -> Option<ast::Expr> {
+    fn end(&self) -> Option<ast::Expr> {
         let op_ix = self.op_details()?.0;
         self.syntax()
             .children_with_tokens()
             .skip(op_ix + 1)
             .find_map(|it| ast::Expr::cast(it.into_node()?))
+    }
+
+    fn op_token(&self) -> Option<SyntaxToken> {
+        self.op_details().map(|t| t.1)
+    }
+
+    fn op_kind(&self) -> Option<RangeOp> {
+        self.op_details().map(|t| t.2)
     }
 }
 
@@ -217,7 +315,7 @@ impl ast::ArrayExpr {
     }
 
     fn is_repeat(&self) -> bool {
-        self.syntax().children_with_tokens().any(|it| it.kind() == T![;])
+        self.semicolon_token().is_some()
     }
 }
 
@@ -225,10 +323,11 @@ impl ast::ArrayExpr {
 pub enum LiteralKind {
     String(ast::String),
     ByteString(ast::ByteString),
+    CString(ast::CString),
     IntNumber(ast::IntNumber),
     FloatNumber(ast::FloatNumber),
-    Char,
-    Byte,
+    Char(ast::Char),
+    Byte(ast::Byte),
     Bool(bool),
 }
 
@@ -236,7 +335,7 @@ impl ast::Literal {
     pub fn token(&self) -> SyntaxToken {
         self.syntax()
             .children_with_tokens()
-            .find(|e| e.kind() != ATTR && !e.kind().is_trivia())
+            .find(|e| !ast::AnyAttr::can_cast(e.kind()) && !e.kind().is_trivia())
             .and_then(|e| e.into_token())
             .unwrap()
     }
@@ -244,43 +343,56 @@ impl ast::Literal {
     pub fn kind(&self) -> LiteralKind {
         let token = self.token();
 
-        if let Some(t) = ast::IntNumber::cast(token.clone()) {
-            return LiteralKind::IntNumber(t);
-        }
-        if let Some(t) = ast::FloatNumber::cast(token.clone()) {
-            return LiteralKind::FloatNumber(t);
-        }
-        if let Some(t) = ast::String::cast(token.clone()) {
-            return LiteralKind::String(t);
-        }
-        if let Some(t) = ast::ByteString::cast(token.clone()) {
-            return LiteralKind::ByteString(t);
-        }
-
-        match token.kind() {
-            T![true] => LiteralKind::Bool(true),
-            T![false] => LiteralKind::Bool(false),
-            CHAR => LiteralKind::Char,
-            BYTE => LiteralKind::Byte,
-            _ => unreachable!(),
-        }
+        match_ast!(match token {
+            ast::IntNumber(t) => LiteralKind::IntNumber(t),
+            ast::FloatNumber(t) => LiteralKind::FloatNumber(t),
+            ast::String(t) => LiteralKind::String(t),
+            ast::ByteString(t) => LiteralKind::ByteString(t),
+            ast::CString(t) => LiteralKind::CString(t),
+            ast::Char(t) => LiteralKind::Char(t),
+            ast::Byte(t) => LiteralKind::Byte(t),
+            _ => match token.kind() {
+                T![true] => LiteralKind::Bool(true),
+                T![false] => LiteralKind::Bool(false),
+                _ => unreachable!(),
+            },
+        })
     }
 }
 
 pub enum BlockModifier {
     Async(SyntaxToken),
     Unsafe(SyntaxToken),
-    Try(SyntaxToken),
+    Try {
+        try_token: SyntaxToken,
+        bikeshed_token: Option<SyntaxToken>,
+        result_type: Option<ast::Type>,
+    },
     Const(SyntaxToken),
+    AsyncGen(SyntaxToken),
+    Gen(SyntaxToken),
     Label(ast::Label),
 }
 
 impl ast::BlockExpr {
     pub fn modifier(&self) -> Option<BlockModifier> {
-        self.async_token()
-            .map(BlockModifier::Async)
+        self.gen_token()
+            .map(|v| {
+                if self.async_token().is_some() {
+                    BlockModifier::AsyncGen(v)
+                } else {
+                    BlockModifier::Gen(v)
+                }
+            })
+            .or_else(|| self.async_token().map(BlockModifier::Async))
             .or_else(|| self.unsafe_token().map(BlockModifier::Unsafe))
-            .or_else(|| self.try_token().map(BlockModifier::Try))
+            .or_else(|| {
+                let modifier = self.try_block_modifier()?;
+                let try_token = modifier.try_token()?;
+                let bikeshed_token = modifier.bikeshed_token();
+                let result_type = modifier.ty();
+                Some(BlockModifier::Try { try_token, bikeshed_token, result_type })
+            })
             .or_else(|| self.const_token().map(BlockModifier::Const))
             .or_else(|| self.label().map(BlockModifier::Label))
     }
@@ -296,13 +408,21 @@ impl ast::BlockExpr {
             Some(it) => it,
             None => return true,
         };
-        !matches!(parent.kind(), FN | IF_EXPR | WHILE_EXPR | LOOP_EXPR)
+        match parent.kind() {
+            FOR_EXPR | IF_EXPR => parent
+                .children()
+                .find(|it| ast::Expr::can_cast(it.kind()))
+                .is_none_or(|it| it == *self.syntax()),
+            LET_ELSE | FN | WHILE_EXPR | LOOP_EXPR | CONST_BLOCK_PAT => false,
+            _ => true,
+        }
     }
 }
 
 #[test]
 fn test_literal_with_attr() {
-    let parse = ast::SourceFile::parse(r#"const _: &str = { #[attr] "Hello" };"#);
+    let parse =
+        ast::SourceFile::parse(r#"const _: &str = { #[attr] "Hello" };"#, parser::Edition::CURRENT);
     let lit = parse.tree().syntax().descendants().find_map(ast::Literal::cast).unwrap();
     assert_eq!(lit.token().text(), r#""Hello""#);
 }
@@ -336,10 +456,8 @@ impl AstNode for CallableExpr {
     {
         if let Some(it) = ast::CallExpr::cast(syntax.clone()) {
             Some(Self::Call(it))
-        } else if let Some(it) = ast::MethodCallExpr::cast(syntax) {
-            Some(Self::MethodCall(it))
         } else {
-            None
+            ast::MethodCallExpr::cast(syntax).map(Self::MethodCall)
         }
     }
 
@@ -348,5 +466,59 @@ impl AstNode for CallableExpr {
             Self::Call(it) => it.syntax(),
             Self::MethodCall(it) => it.syntax(),
         }
+    }
+}
+
+impl MacroDef {
+    fn tts(&self) -> (Option<ast::TokenTree>, Option<ast::TokenTree>) {
+        let mut types = support::children(self.syntax());
+        let first = types.next();
+        let second = types.next();
+        (first, second)
+    }
+
+    pub fn args(&self) -> Option<TokenTree> {
+        match self.tts() {
+            (Some(args), Some(_)) => Some(args),
+            _ => None,
+        }
+    }
+
+    pub fn body(&self) -> Option<TokenTree> {
+        match self.tts() {
+            (Some(body), None) | (_, Some(body)) => Some(body),
+            _ => None,
+        }
+    }
+}
+
+impl ClosureExpr {
+    pub fn body(&self) -> Option<Expr> {
+        support::child(&self.syntax)
+    }
+}
+impl Const {
+    pub fn body(&self) -> Option<Expr> {
+        support::child(&self.syntax)
+    }
+}
+impl Fn {
+    pub fn body(&self) -> Option<BlockExpr> {
+        support::child(&self.syntax)
+    }
+}
+impl Static {
+    pub fn body(&self) -> Option<Expr> {
+        support::child(&self.syntax)
+    }
+}
+impl FormatArgsExpr {
+    pub fn args(&self) -> AstChildren<FormatArgsArg> {
+        support::children(&self.syntax)
+    }
+}
+impl ArgList {
+    pub fn args(&self) -> AstChildren<Expr> {
+        support::children(&self.syntax)
     }
 }

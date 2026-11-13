@@ -1,7 +1,10 @@
 //! Defines token tags we use for syntax highlighting.
 //! A tag is not unlike a CSS class.
 
-use std::{fmt, ops};
+use std::{
+    fmt::{self, Write},
+    ops,
+};
 
 use ide_db::SymbolKind;
 
@@ -18,15 +21,15 @@ pub struct HlMods(u32);
 pub enum HlTag {
     Symbol(SymbolKind),
 
-    Attribute,
+    AttributeBracket,
     BoolLiteral,
-    BuiltinAttr,
     BuiltinType,
     ByteLiteral,
     CharLiteral,
     Comment,
     EscapeSequence,
     FormatSpecifier,
+    InvalidEscapeSequence,
     Keyword,
     NumericLiteral,
     Operator(HlOperator),
@@ -43,14 +46,16 @@ pub enum HlTag {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[repr(u8)]
 pub enum HlMod {
-    /// Used for items in traits and impls.
+    /// Used for associated items.
     Associated = 0,
     /// Used with keywords like `async` and `await`.
     Async,
-    /// Used to differentiate individual elements within attributes.
+    /// Used to differentiate individual elements within attribute calls.
     Attribute,
     /// Callable item or value.
     Callable,
+    /// Constant operation.
+    Const,
     /// Value that is being consumed in a function call
     Consuming,
     /// Used with keywords like `if` and `break`.
@@ -62,6 +67,8 @@ pub enum HlMod {
     /// `foo` in `fn foo(x: i32)` is a definition, `foo` in `foo(90 + 2)` is
     /// not.
     Definition,
+    /// Used for things with the `#[deprecated]` attribute.
+    Deprecated,
     /// Doc-strings like this one.
     Documentation,
     /// Highlighting injection like rust code in doc strings or ra_fixture.
@@ -70,13 +77,17 @@ pub enum HlMod {
     IntraDocLink,
     /// Used for items from other crates.
     Library,
+    /// Used to differentiate individual elements within macro calls.
+    Macro,
+    /// Used to differentiate individual elements within proc-macro calls.
+    ProcMacro,
     /// Mutable binding.
     Mutable,
     /// Used for public items.
     Public,
     /// Immutable reference.
     Reference,
-    /// Used for associated functions.
+    /// Used for associated items, except Methods. (Some languages call these static members)
     Static,
     /// Used for items in traits and trait impls.
     Trait,
@@ -103,7 +114,9 @@ pub enum HlPunct {
     Colon,
     /// ;
     Semi,
-    ///
+    /// ! (only for macro calls)
+    MacroBang,
+    /// Other punctutations
     Other,
 }
 
@@ -113,11 +126,13 @@ pub enum HlOperator {
     Bitwise,
     /// +, -, *, /, +=, -=, *=, /=
     Arithmetic,
-    /// &&, ||, !
+    /// &&, ||
     Logical,
+    /// !
+    Negation,
     /// >, <, ==, >=, <=, !=
     Comparison,
-    ///
+    /// Other operators
     Other,
 }
 
@@ -125,35 +140,45 @@ impl HlTag {
     fn as_str(self) -> &'static str {
         match self {
             HlTag::Symbol(symbol) => match symbol {
+                SymbolKind::Attribute => "attribute",
+                SymbolKind::BuiltinAttr => "builtin_attr",
                 SymbolKind::Const => "constant",
-                SymbolKind::Static => "static",
+                SymbolKind::ConstParam => "const_param",
+                SymbolKind::CrateRoot => "crate_root",
+                SymbolKind::Derive => "derive",
+                SymbolKind::DeriveHelper => "derive_helper",
                 SymbolKind::Enum => "enum",
-                SymbolKind::Variant => "enum_variant",
-                SymbolKind::Struct => "struct",
-                SymbolKind::Union => "union",
                 SymbolKind::Field => "field",
-                SymbolKind::Module => "module",
-                SymbolKind::Trait => "trait",
                 SymbolKind::Function => "function",
+                SymbolKind::Impl => "self_type",
+                SymbolKind::InlineAsmRegOrRegClass => "reg",
+                SymbolKind::Label => "label",
+                SymbolKind::LifetimeParam => "lifetime",
+                SymbolKind::Local => "variable",
+                SymbolKind::Macro => "macro",
+                SymbolKind::Method => "method",
+                SymbolKind::ProcMacro => "proc_macro",
+                SymbolKind::Module => "module",
+                SymbolKind::SelfParam => "self_keyword",
+                SymbolKind::SelfType => "self_type_keyword",
+                SymbolKind::Static => "static",
+                SymbolKind::Struct => "struct",
+                SymbolKind::ToolModule => "tool_module",
+                SymbolKind::Trait => "trait",
                 SymbolKind::TypeAlias => "type_alias",
                 SymbolKind::TypeParam => "type_param",
-                SymbolKind::ConstParam => "const_param",
-                SymbolKind::LifetimeParam => "lifetime",
-                SymbolKind::Macro => "macro",
-                SymbolKind::Local => "variable",
-                SymbolKind::Label => "label",
+                SymbolKind::Union => "union",
                 SymbolKind::ValueParam => "value_param",
-                SymbolKind::SelfParam => "self_keyword",
-                SymbolKind::Impl => "self_type",
+                SymbolKind::Variant => "enum_variant",
             },
-            HlTag::Attribute => "attribute",
+            HlTag::AttributeBracket => "attribute_bracket",
             HlTag::BoolLiteral => "bool_literal",
-            HlTag::BuiltinAttr => "builtin_attr",
             HlTag::BuiltinType => "builtin_type",
             HlTag::ByteLiteral => "byte_literal",
             HlTag::CharLiteral => "char_literal",
             HlTag::Comment => "comment",
             HlTag::EscapeSequence => "escape_sequence",
+            HlTag::InvalidEscapeSequence => "invalid_escape_sequence",
             HlTag::FormatSpecifier => "format_specifier",
             HlTag::Keyword => "keyword",
             HlTag::Punctuation(punct) => match punct {
@@ -165,6 +190,7 @@ impl HlTag {
                 HlPunct::Dot => "dot",
                 HlPunct::Colon => "colon",
                 HlPunct::Semi => "semicolon",
+                HlPunct::MacroBang => "macro_bang",
                 HlPunct::Other => "punctuation",
             },
             HlTag::NumericLiteral => "numeric_literal",
@@ -173,6 +199,7 @@ impl HlTag {
                 HlOperator::Arithmetic => "arithmetic",
                 HlOperator::Logical => "logical",
                 HlOperator::Comparison => "comparison",
+                HlOperator::Negation => "negation",
                 HlOperator::Other => "operator",
             },
             HlTag::StringLiteral => "string_literal",
@@ -189,21 +216,25 @@ impl fmt::Display for HlTag {
 }
 
 impl HlMod {
-    const ALL: &'static [HlMod; HlMod::Unsafe as u8 as usize + 1] = &[
+    const ALL: &'static [HlMod; HlMod::Unsafe as usize + 1] = &[
         HlMod::Associated,
         HlMod::Async,
         HlMod::Attribute,
         HlMod::Callable,
+        HlMod::Const,
         HlMod::Consuming,
         HlMod::ControlFlow,
         HlMod::CrateRoot,
         HlMod::DefaultLibrary,
         HlMod::Definition,
+        HlMod::Deprecated,
         HlMod::Documentation,
         HlMod::Injected,
         HlMod::IntraDocLink,
         HlMod::Library,
+        HlMod::Macro,
         HlMod::Mutable,
+        HlMod::ProcMacro,
         HlMod::Public,
         HlMod::Reference,
         HlMod::Static,
@@ -218,14 +249,18 @@ impl HlMod {
             HlMod::Attribute => "attribute",
             HlMod::Callable => "callable",
             HlMod::Consuming => "consuming",
+            HlMod::Const => "const",
             HlMod::ControlFlow => "control",
             HlMod::CrateRoot => "crate_root",
             HlMod::DefaultLibrary => "default_library",
             HlMod::Definition => "declaration",
+            HlMod::Deprecated => "deprecated",
             HlMod::Documentation => "documentation",
             HlMod::Injected => "injected",
             HlMod::IntraDocLink => "intra_doc_link",
             HlMod::Library => "library",
+            HlMod::Macro => "macro",
+            HlMod::ProcMacro => "proc_macro",
             HlMod::Mutable => "mutable",
             HlMod::Public => "public",
             HlMod::Reference => "reference",
@@ -236,6 +271,7 @@ impl HlMod {
     }
 
     fn mask(self) -> u32 {
+        debug_assert!(Self::ALL.len() <= 32, "HlMod::mask is not enough to cover all variants");
         1 << (self as u32)
     }
 }
@@ -248,9 +284,10 @@ impl fmt::Display for HlMod {
 
 impl fmt::Display for Highlight {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.tag)?;
+        self.tag.fmt(f)?;
         for modifier in self.mods.iter() {
-            write!(f, ".{}", modifier)?
+            f.write_char('.')?;
+            modifier.fmt(f)?;
         }
         Ok(())
     }
@@ -285,7 +322,7 @@ impl Highlight {
         Highlight { tag, mods: HlMods::default() }
     }
     pub fn is_empty(&self) -> bool {
-        self.tag == HlTag::None && self.mods == HlMods::default()
+        self.tag == HlTag::None && self.mods.is_empty()
     }
 }
 
@@ -319,6 +356,10 @@ impl ops::BitOr<HlMod> for Highlight {
 }
 
 impl HlMods {
+    pub fn is_empty(&self) -> bool {
+        self.0 == 0
+    }
+
     pub fn contains(self, m: HlMod) -> bool {
         self.0 & m.mask() == m.mask()
     }

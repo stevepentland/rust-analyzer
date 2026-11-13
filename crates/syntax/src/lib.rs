@@ -1,4 +1,4 @@
-//! Syntax Tree library used throughout the rust analyzer.
+//! Syntax Tree library used throughout the rust-analyzer.
 //!
 //! Properties:
 //!   - easy and fast incremental re-parsing
@@ -10,8 +10,8 @@
 //! the [Swift] one.
 //!
 //! The most interesting modules here are `syntax_node` (which defines concrete
-//! syntax tree) and `ast` (which defines abstract syntax tree on top of the
-//! CST). The actual parser live in a separate `parser` crate, though the
+//! syntax tree) and [`ast`] (which defines abstract syntax tree on top of the
+//! CST). The actual parser live in a separate [`parser`] crate, though the
 //! lexer lives in this crate.
 //!
 //! See `api_walkthrough` test in this file for a quick API tour!
@@ -19,49 +19,52 @@
 //! [RFC]: <https://github.com/rust-lang/rfcs/pull/2256>
 //! [Swift]: <https://github.com/apple/swift/blob/13d593df6f359d0cb2fc81cfaac273297c539455/lib/Syntax/README.md>
 
-#[allow(unused)]
-macro_rules! eprintln {
-    ($($tt:tt)*) => { stdx::eprintln!($($tt)*) };
-}
+#![cfg_attr(feature = "in-rust-tree", feature(rustc_private))]
 
-mod syntax_node;
-mod syntax_error;
+#[cfg(not(feature = "in-rust-tree"))]
+extern crate ra_ap_rustc_lexer as rustc_lexer;
+#[cfg(feature = "in-rust-tree")]
+extern crate rustc_driver as _;
+#[cfg(feature = "in-rust-tree")]
+extern crate rustc_lexer;
+
 mod parsing;
-mod validation;
 mod ptr;
-mod token_text;
+mod syntax_error;
+mod syntax_node;
 #[cfg(test)]
 mod tests;
+mod validation;
 
-pub mod display;
 pub mod algo;
 pub mod ast;
 #[doc(hidden)]
 pub mod fuzz;
+pub mod hacks;
+pub mod syntax_editor;
 pub mod utils;
-pub mod ted;
 
-use std::{marker::PhantomData, sync::Arc};
+use std::{marker::PhantomData, ops::Range};
 
 use stdx::format_to;
-use text_edit::Indel;
+use triomphe::Arc;
 
 pub use crate::{
     ast::{AstNode, AstToken},
-    parsing::lexer::{lex_single_syntax_kind, lex_single_valid_syntax_kind, tokenize, Token},
     ptr::{AstPtr, SyntaxNodePtr},
     syntax_error::SyntaxError,
     syntax_node::{
-        PreorderWithTokens, SyntaxElement, SyntaxElementChildren, SyntaxNode, SyntaxNodeChildren,
-        SyntaxToken, SyntaxTreeBuilder,
+        PreorderWithTokens, RustLanguage, SyntaxElement, SyntaxElementChildren, SyntaxNode,
+        SyntaxNodeChildren, SyntaxToken, SyntaxTreeBuilder,
     },
-    token_text::TokenText,
 };
-pub use parser::{SyntaxKind, T};
+pub use parser::{Edition, SyntaxKind, T};
 pub use rowan::{
     Direction, GreenNode, NodeOrToken, SyntaxText, TextRange, TextSize, TokenAtOffset, WalkEvent,
+    api::Preorder,
 };
-pub use smol_str::SmolStr;
+pub use rustc_literal_escaper as unescape;
+pub use smol_str::{SmolStr, SmolStrBuilder, ToSmolStr, format_smolstr};
 
 /// `Parse` is the result of the parsing: a syntax tree and a collection of
 /// errors.
@@ -70,8 +73,8 @@ pub use smol_str::SmolStr;
 /// files.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Parse<T> {
-    green: GreenNode,
-    errors: Arc<Vec<SyntaxError>>,
+    green: Option<GreenNode>,
+    errors: Option<Arc<[SyntaxError]>>,
     _ty: PhantomData<fn() -> T>,
 }
 
@@ -83,39 +86,55 @@ impl<T> Clone for Parse<T> {
 
 impl<T> Parse<T> {
     fn new(green: GreenNode, errors: Vec<SyntaxError>) -> Parse<T> {
-        Parse { green, errors: Arc::new(errors), _ty: PhantomData }
+        Parse {
+            green: Some(green),
+            errors: if errors.is_empty() { None } else { Some(errors.into()) },
+            _ty: PhantomData,
+        }
     }
 
     pub fn syntax_node(&self) -> SyntaxNode {
-        SyntaxNode::new_root(self.green.clone())
+        SyntaxNode::new_root(self.green.as_ref().unwrap().clone())
     }
-    pub fn errors(&self) -> &[SyntaxError] {
-        &*self.errors
+
+    pub fn errors(&self) -> Vec<SyntaxError> {
+        let mut errors = if let Some(e) = self.errors.as_deref() { e.to_vec() } else { vec![] };
+        validation::validate(&self.syntax_node(), &mut errors);
+        errors
     }
 }
 
 impl<T: AstNode> Parse<T> {
-    pub fn to_syntax(self) -> Parse<SyntaxNode> {
-        Parse { green: self.green, errors: self.errors, _ty: PhantomData }
+    /// Converts this parse result into a parse result for an untyped syntax tree.
+    pub fn to_syntax(mut self) -> Parse<SyntaxNode> {
+        let green = self.green.take();
+        let errors = self.errors.take();
+        Parse { green, errors, _ty: PhantomData }
     }
 
+    /// Gets the parsed syntax tree as a typed ast node.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the root node cannot be casted into the typed ast node
+    /// (e.g. if it's an `ERROR` node).
     pub fn tree(&self) -> T {
         T::cast(self.syntax_node()).unwrap()
     }
 
-    pub fn ok(self) -> Result<T, Arc<Vec<SyntaxError>>> {
-        if self.errors.is_empty() {
-            Ok(self.tree())
-        } else {
-            Err(self.errors)
+    /// Converts from `Parse<T>` to [`Result<T, Vec<SyntaxError>>`].
+    pub fn ok(self) -> Result<T, Vec<SyntaxError>> {
+        match self.errors() {
+            errors if !errors.is_empty() => Err(errors),
+            _ => Ok(self.tree()),
         }
     }
 }
 
 impl Parse<SyntaxNode> {
-    pub fn cast<N: AstNode>(self) -> Option<Parse<N>> {
+    pub fn cast<N: AstNode>(mut self) -> Option<Parse<N>> {
         if N::cast(self.syntax_node()).is_some() {
-            Some(Parse { green: self.green, errors: self.errors, _ty: PhantomData })
+            Some(Parse { green: self.green.take(), errors: self.errors.take(), _ty: PhantomData })
         } else {
             None
         }
@@ -125,31 +144,98 @@ impl Parse<SyntaxNode> {
 impl Parse<SourceFile> {
     pub fn debug_dump(&self) -> String {
         let mut buf = format!("{:#?}", self.tree().syntax());
-        for err in self.errors.iter() {
+        for err in self.errors() {
             format_to!(buf, "error {:?}: {}\n", err.range(), err);
         }
         buf
     }
 
-    pub fn reparse(&self, indel: &Indel) -> Parse<SourceFile> {
-        self.incremental_reparse(indel).unwrap_or_else(|| self.full_reparse(indel))
+    pub fn reparse(&self, delete: TextRange, insert: &str, edition: Edition) -> Parse<SourceFile> {
+        self.incremental_reparse(delete, insert, edition)
+            .unwrap_or_else(|| self.full_reparse(delete, insert, edition))
     }
 
-    fn incremental_reparse(&self, indel: &Indel) -> Option<Parse<SourceFile>> {
+    fn incremental_reparse(
+        &self,
+        delete: TextRange,
+        insert: &str,
+        edition: Edition,
+    ) -> Option<Parse<SourceFile>> {
         // FIXME: validation errors are not handled here
-        parsing::incremental_reparse(self.tree().syntax(), indel, self.errors.to_vec()).map(
-            |(green_node, errors, _reparsed_range)| Parse {
-                green: green_node,
-                errors: Arc::new(errors),
-                _ty: PhantomData,
-            },
+        parsing::incremental_reparse(
+            self.tree().syntax(),
+            delete,
+            insert,
+            self.errors.as_deref().unwrap_or_default().iter().cloned(),
+            edition,
         )
+        .map(|(green_node, errors, _reparsed_range)| Parse {
+            green: Some(green_node),
+            errors: if errors.is_empty() { None } else { Some(errors.into()) },
+            _ty: PhantomData,
+        })
     }
 
-    fn full_reparse(&self, indel: &Indel) -> Parse<SourceFile> {
+    fn full_reparse(&self, delete: TextRange, insert: &str, edition: Edition) -> Parse<SourceFile> {
         let mut text = self.tree().syntax().text().to_string();
-        indel.apply(&mut text);
-        SourceFile::parse(&text)
+        text.replace_range(Range::<usize>::from(delete), insert);
+        SourceFile::parse(&text, edition)
+    }
+}
+
+impl ast::Expr {
+    /// Parses an `ast::Expr` from `text`.
+    ///
+    /// Note that if the parsed root node is not a valid expression, [`Parse::tree`] will panic.
+    /// For example:
+    /// ```rust,should_panic
+    /// # use syntax::{ast, Edition};
+    /// ast::Expr::parse("let fail = true;", Edition::CURRENT).tree();
+    /// ```
+    pub fn parse(text: &str, edition: Edition) -> Parse<ast::Expr> {
+        let _p = tracing::info_span!("Expr::parse").entered();
+        let (green, errors) = parsing::parse_text_at(text, parser::TopEntryPoint::Expr, edition);
+        let root = SyntaxNode::new_root(green.clone());
+
+        assert!(
+            ast::Expr::can_cast(root.kind()) || root.kind() == SyntaxKind::ERROR,
+            "{:?} isn't an expression",
+            root.kind()
+        );
+        Parse::new(green, errors)
+    }
+}
+
+#[cfg(not(no_salsa_async_drops))]
+impl<T> Drop for Parse<T> {
+    fn drop(&mut self) {
+        let Some(green) = self.green.take() else {
+            return;
+        };
+        static PARSE_DROP_THREAD: std::sync::OnceLock<std::sync::mpsc::Sender<GreenNode>> =
+            std::sync::OnceLock::new();
+        PARSE_DROP_THREAD
+            .get_or_init(|| {
+                let (sender, receiver) = std::sync::mpsc::channel::<GreenNode>();
+                std::thread::Builder::new()
+                    .name("ParseNodeDropper".to_owned())
+                    .spawn(move || {
+                        loop {
+                            // block on a receive
+                            _ = receiver.recv();
+                            // then drain the entire channel
+                            while receiver.try_recv().is_ok() {}
+                            // and sleep for a bit
+                            std::thread::sleep(std::time::Duration::from_millis(100));
+                        }
+                        // why do this over just a `receiver.iter().for_each(drop)`? To reduce contention on the channel lock.
+                        // otherwise this thread will constantly wake up and sleep again.
+                    })
+                    .unwrap();
+                sender
+            })
+            .send(green)
+            .unwrap();
     }
 }
 
@@ -157,69 +243,13 @@ impl Parse<SourceFile> {
 pub use crate::ast::SourceFile;
 
 impl SourceFile {
-    pub fn parse(text: &str) -> Parse<SourceFile> {
-        let (green, mut errors) = parsing::parse_text(text);
+    pub fn parse(text: &str, edition: Edition) -> Parse<SourceFile> {
+        let _p = tracing::info_span!("SourceFile::parse").entered();
+        let (green, errors) = parsing::parse_text(text, edition);
         let root = SyntaxNode::new_root(green.clone());
 
-        errors.extend(validation::validate(&root));
-
         assert_eq!(root.kind(), SyntaxKind::SOURCE_FILE);
-        Parse { green, errors: Arc::new(errors), _ty: PhantomData }
-    }
-}
-
-// FIXME: `parse` functions shouldn't hang directly from AST nodes, and they
-// shouldn't return `Result`.
-//
-// We need a dedicated module for parser entry points, and they should always
-// return `Parse`.
-
-impl ast::Path {
-    /// Returns `text`, parsed as a path, but only if it has no errors.
-    pub fn parse(text: &str) -> Result<Self, ()> {
-        parsing::parse_text_as(text, parser::ParserEntryPoint::Path)
-    }
-}
-
-impl ast::Pat {
-    /// Returns `text`, parsed as a pattern, but only if it has no errors.
-    pub fn parse(text: &str) -> Result<Self, ()> {
-        parsing::parse_text_as(text, parser::ParserEntryPoint::Pattern)
-    }
-}
-
-impl ast::Expr {
-    /// Returns `text`, parsed as an expression, but only if it has no errors.
-    pub fn parse(text: &str) -> Result<Self, ()> {
-        parsing::parse_text_as(text, parser::ParserEntryPoint::Expr)
-    }
-}
-
-impl ast::Item {
-    /// Returns `text`, parsed as an item, but only if it has no errors.
-    pub fn parse(text: &str) -> Result<Self, ()> {
-        parsing::parse_text_as(text, parser::ParserEntryPoint::Item)
-    }
-}
-
-impl ast::Type {
-    /// Returns `text`, parsed as an type reference, but only if it has no errors.
-    pub fn parse(text: &str) -> Result<Self, ()> {
-        parsing::parse_text_as(text, parser::ParserEntryPoint::Type)
-    }
-}
-
-impl ast::Attr {
-    /// Returns `text`, parsed as an attribute, but only if it has no errors.
-    pub fn parse(text: &str) -> Result<Self, ()> {
-        parsing::parse_text_as(text, parser::ParserEntryPoint::Attr)
-    }
-}
-
-impl ast::Stmt {
-    /// Returns `text`, parsed as statement, but only if it has no errors.
-    pub fn parse(text: &str) -> Result<Self, ()> {
-        parsing::parse_text_as(text, parser::ParserEntryPoint::StatementOptionalSemi)
+        Parse::new(green, errors)
     }
 }
 
@@ -239,14 +269,17 @@ impl ast::Stmt {
 /// ```
 #[macro_export]
 macro_rules! match_ast {
-    (match $node:ident { $($tt:tt)* }) => { match_ast!(match ($node) { $($tt)* }) };
+    (match $node:ident { $($tt:tt)* }) => { $crate::match_ast!(match ($node) { $($tt)* }) };
 
     (match ($node:expr) {
-        $( ast::$ast:ident($it:ident) => $res:expr, )*
+        $( $( $path:ident )::+ ($it:pat) $(if $guard:expr)? => $res:expr, )*
         _ => $catch_all:expr $(,)?
     }) => {{
-        $( if let Some($it) = ast::$ast::cast($node.clone()) { $res } else )*
-        { $catch_all }
+        #[allow(clippy::question_mark, reason = "if `$catch_all` is `return None` Clippy can mark this")]
+        {
+            $( if let Some($it) = $($path::)+cast($node.clone()) $(&& $guard)? { $res } else )*
+            { $catch_all }
+        }
     }};
 }
 
@@ -265,11 +298,11 @@ fn api_walkthrough() {
     //
     // The `parse` method returns a `Parse` -- a pair of syntax tree and a list
     // of errors. That is, syntax tree is constructed even in presence of errors.
-    let parse = SourceFile::parse(source_code);
+    let parse = SourceFile::parse(source_code, parser::Edition::CURRENT);
     assert!(parse.errors().is_empty());
 
     // The `tree` method returns an owned syntax node of type `SourceFile`.
-    // Owned nodes are cheap: inside, they are `Rc` handles to the underling data.
+    // Owned nodes are cheap: inside, they are `Rc` handles to the underlying data.
     let file: SourceFile = parse.tree();
 
     // `SourceFile` is the root of the syntax tree. We can iterate file's items.
@@ -344,7 +377,7 @@ fn api_walkthrough() {
     assert!(expr_syntax.siblings_with_tokens(Direction::Next).any(|it| it.kind() == T!['}']));
     assert_eq!(
         expr_syntax.descendants_with_tokens().count(),
-        8, // 5 tokens `1`, ` `, `+`, ` `, `!`
+        8, // 5 tokens `1`, ` `, `+`, ` `, `1`
            // 2 child literal expressions: `1`, `1`
            // 1 the node itself: `1 + 1`
     );
@@ -357,7 +390,7 @@ fn api_walkthrough() {
             WalkEvent::Enter(node) => {
                 let text = match &node {
                     NodeOrToken::Node(it) => it.text().to_string(),
-                    NodeOrToken::Token(it) => it.text().to_string(),
+                    NodeOrToken::Token(it) => it.text().to_owned(),
                 };
                 format_to!(buf, "{:indent$}{:?} {:?}\n", " ", text, node.kind(), indent = indent);
                 indent += 2;

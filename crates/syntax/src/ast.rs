@@ -1,37 +1,39 @@
 //! Abstract Syntax Tree, layered on top of untyped `SyntaxNode`s
 
-mod generated;
-mod traits;
-mod token_ext;
-mod node_ext;
-mod expr_ext;
-mod operators;
 pub mod edit;
-pub mod edit_in_place;
+mod expr_ext;
+mod generated;
 pub mod make;
+mod node_ext;
+mod operators;
+pub mod prec;
+pub mod syntax_factory;
+mod token_ext;
+mod traits;
 
 use std::marker::PhantomData;
 
+use either::Either;
+
 use crate::{
-    syntax_node::{SyntaxNode, SyntaxNodeChildren, SyntaxToken},
     SyntaxKind,
+    syntax_node::{SyntaxNode, SyntaxNodeChildren, SyntaxToken},
 };
 
 pub use self::{
     expr_ext::{ArrayExprKind, BlockModifier, CallableExpr, ElseBranch, LiteralKind},
     generated::{nodes::*, tokens::*},
     node_ext::{
-        AttrKind, FieldKind, Macro, NameLike, NameOrNameRef, PathSegmentKind, SelfParamKind,
-        SlicePatComponents, StructKind, TypeBoundKind, VisibilityKind,
+        AttrKind, CfgAtomKey, FieldKind, Macro, NameLike, NameOrNameRef, PathSegmentKind,
+        SelfParamKind, SlicePatComponents, StructKind, TokenTreeChildren, TypeBoundKind,
+        TypeOrConstParam, VisibilityKind,
     },
     operators::{ArithOp, BinaryOp, CmpOp, LogicOp, Ordering, RangeOp, UnaryOp},
-    token_ext::{
-        CommentKind, CommentPlacement, CommentShape, FormatSpecifier, HasFormatSpecifier, IsString,
-        QuoteOffsets, Radix,
-    },
+    token_ext::{AnyComment, AnyString, CommentKind, CommentShape, IsString, QuoteOffsets, Radix},
     traits::{
-        CommentIter, HasArgList, HasAttrs, HasDocComments, HasGenericParams, HasLoopBody,
-        HasModuleItem, HasName, HasTypeBounds, HasVisibility,
+        AttrsIter, HasArgList, HasAttrs, HasGenericArgs, HasGenericParams, HasLoopBody,
+        HasModuleItem, HasName, HasTypeBounds, HasVisibility, attrs_including_inner,
+        attrs_with_doc_including_inner,
     },
 };
 
@@ -40,6 +42,14 @@ pub use self::{
 /// the same representation: a pointer to the tree root and a pointer to the
 /// node itself.
 pub trait AstNode {
+    /// This panics if the `SyntaxKind` is not statically known.
+    fn kind() -> SyntaxKind
+    where
+        Self: Sized,
+    {
+        panic!("dynamic `SyntaxKind` for `AstNode::kind()`")
+    }
+
     fn can_cast(kind: SyntaxKind) -> bool
     where
         Self: Sized;
@@ -49,12 +59,6 @@ pub trait AstNode {
         Self: Sized;
 
     fn syntax(&self) -> &SyntaxNode;
-    fn clone_for_update(&self) -> Self
-    where
-        Self: Sized,
-    {
-        Self::cast(self.syntax().clone_for_update()).unwrap()
-    }
     fn clone_subtree(&self) -> Self
     where
         Self: Sized,
@@ -100,24 +104,80 @@ impl<N: AstNode> Iterator for AstChildren<N> {
     }
 }
 
+impl<L, R> AstNode for Either<L, R>
+where
+    L: AstNode,
+    R: AstNode,
+{
+    fn can_cast(kind: SyntaxKind) -> bool
+    where
+        Self: Sized,
+    {
+        L::can_cast(kind) || R::can_cast(kind)
+    }
+
+    fn cast(syntax: SyntaxNode) -> Option<Self>
+    where
+        Self: Sized,
+    {
+        if L::can_cast(syntax.kind()) {
+            L::cast(syntax).map(Either::Left)
+        } else {
+            R::cast(syntax).map(Either::Right)
+        }
+    }
+
+    fn syntax(&self) -> &SyntaxNode {
+        self.as_ref().either(L::syntax, R::syntax)
+    }
+}
+
+impl<L, R> HasAttrs for Either<L, R>
+where
+    L: HasAttrs,
+    R: HasAttrs,
+{
+}
+
+/// Trait to describe operations common to both `RangeExpr` and `RangePat`.
+pub trait RangeItem {
+    type Bound;
+
+    fn start(&self) -> Option<Self::Bound>;
+    fn end(&self) -> Option<Self::Bound>;
+    fn op_kind(&self) -> Option<RangeOp>;
+    fn op_token(&self) -> Option<SyntaxToken>;
+}
+
 mod support {
     use super::{AstChildren, AstNode, SyntaxKind, SyntaxNode, SyntaxToken};
 
+    #[inline]
     pub(super) fn child<N: AstNode>(parent: &SyntaxNode) -> Option<N> {
         parent.children().find_map(N::cast)
     }
 
+    #[inline]
     pub(super) fn children<N: AstNode>(parent: &SyntaxNode) -> AstChildren<N> {
         AstChildren::new(parent)
     }
 
+    #[inline]
     pub(super) fn token(parent: &SyntaxNode, kind: SyntaxKind) -> Option<SyntaxToken> {
         parent.children_with_tokens().filter_map(|it| it.into_token()).find(|it| it.kind() == kind)
     }
 }
 
+#[cfg(test)]
+fn doc_comment_text(owner: impl HasAttrs) -> Option<std::string::String> {
+    use itertools::Itertools;
+
+    let docs = owner.doc_comments().map(|comment| comment.text().to_owned()).join("\n");
+    if docs.is_empty() { None } else { Some(docs) }
+}
+
 #[test]
-fn assert_ast_is_object_safe() {
+fn assert_ast_is_dyn_compatible() {
     fn _f(_: &dyn AstNode, _: &dyn HasName) {}
 }
 
@@ -128,11 +188,12 @@ fn test_doc_comment_none() {
         // non-doc
         mod foo {}
         "#,
+        parser::Edition::CURRENT,
     )
     .ok()
     .unwrap();
     let module = file.syntax().descendants().find_map(Module::cast).unwrap();
-    assert!(module.doc_comments().doc_comment_text().is_none());
+    assert!(doc_comment_text(module).is_none());
 }
 
 #[test]
@@ -143,11 +204,12 @@ fn test_outer_doc_comment_of_items() {
         // non-doc
         mod foo {}
         "#,
+        parser::Edition::CURRENT,
     )
     .ok()
     .unwrap();
     let module = file.syntax().descendants().find_map(Module::cast).unwrap();
-    assert_eq!(" doc", module.doc_comments().doc_comment_text().unwrap());
+    assert_eq!(" doc", doc_comment_text(module).unwrap());
 }
 
 #[test]
@@ -158,11 +220,12 @@ fn test_inner_doc_comment_of_items() {
         // non-doc
         mod foo {}
         "#,
+        parser::Edition::CURRENT,
     )
     .ok()
     .unwrap();
     let module = file.syntax().descendants().find_map(Module::cast).unwrap();
-    assert!(module.doc_comments().doc_comment_text().is_none());
+    assert!(doc_comment_text(module).is_none());
 }
 
 #[test]
@@ -172,11 +235,12 @@ fn test_doc_comment_of_statics() {
         /// Number of levels
         static LEVELS: i32 = 0;
         "#,
+        parser::Edition::CURRENT,
     )
     .ok()
     .unwrap();
     let st = file.syntax().descendants().find_map(Static::cast).unwrap();
-    assert_eq!(" Number of levels", st.doc_comments().doc_comment_text().unwrap());
+    assert_eq!(" Number of levels", doc_comment_text(st).unwrap());
 }
 
 #[test]
@@ -191,13 +255,14 @@ fn test_doc_comment_preserves_indents() {
         /// ```
         mod foo {}
         "#,
+        parser::Edition::CURRENT,
     )
     .ok()
     .unwrap();
     let module = file.syntax().descendants().find_map(Module::cast).unwrap();
     assert_eq!(
         " doc1\n ```\n fn foo() {\n     // ...\n }\n ```",
-        module.doc_comments().doc_comment_text().unwrap()
+        doc_comment_text(module).unwrap()
     );
 }
 
@@ -211,11 +276,12 @@ fn test_doc_comment_preserves_newlines() {
         /// foo
         mod foo {}
         "#,
+        parser::Edition::CURRENT,
     )
     .ok()
     .unwrap();
     let module = file.syntax().descendants().find_map(Module::cast).unwrap();
-    assert_eq!(" this\n is\n mod\n foo", module.doc_comments().doc_comment_text().unwrap());
+    assert_eq!(" this\n is\n mod\n foo", doc_comment_text(module).unwrap());
 }
 
 #[test]
@@ -225,11 +291,12 @@ fn test_doc_comment_single_line_block_strips_suffix() {
         /** this is mod foo*/
         mod foo {}
         "#,
+        parser::Edition::CURRENT,
     )
     .ok()
     .unwrap();
     let module = file.syntax().descendants().find_map(Module::cast).unwrap();
-    assert_eq!(" this is mod foo", module.doc_comments().doc_comment_text().unwrap());
+    assert_eq!(" this is mod foo", doc_comment_text(module).unwrap());
 }
 
 #[test]
@@ -239,11 +306,12 @@ fn test_doc_comment_single_line_block_strips_suffix_whitespace() {
         /** this is mod foo */
         mod foo {}
         "#,
+        parser::Edition::CURRENT,
     )
     .ok()
     .unwrap();
     let module = file.syntax().descendants().find_map(Module::cast).unwrap();
-    assert_eq!(" this is mod foo ", module.doc_comments().doc_comment_text().unwrap());
+    assert_eq!(" this is mod foo ", doc_comment_text(module).unwrap());
 }
 
 #[test]
@@ -257,27 +325,28 @@ fn test_doc_comment_multi_line_block_strips_suffix() {
         */
         mod foo {}
         "#,
+        parser::Edition::CURRENT,
     )
     .ok()
     .unwrap();
     let module = file.syntax().descendants().find_map(Module::cast).unwrap();
     assert_eq!(
         "\n        this\n        is\n        mod foo\n        ",
-        module.doc_comments().doc_comment_text().unwrap()
+        doc_comment_text(module).unwrap()
     );
 }
 
 #[test]
 fn test_comments_preserve_trailing_whitespace() {
     let file = SourceFile::parse(
-        "\n/// Representation of a Realm.   \n/// In the specification these are called Realm Records.\nstruct Realm {}",
+        "\n/// Representation of a Realm.   \n/// In the specification these are called Realm Records.\nstruct Realm {}", parser::Edition::CURRENT,
     )
     .ok()
     .unwrap();
     let def = file.syntax().descendants().find_map(Struct::cast).unwrap();
     assert_eq!(
         " Representation of a Realm.   \n In the specification these are called Realm Records.",
-        def.doc_comments().doc_comment_text().unwrap()
+        doc_comment_text(def).unwrap()
     );
 }
 
@@ -289,11 +358,12 @@ fn test_four_slash_line_comment() {
         /// doc comment
         mod foo {}
         "#,
+        parser::Edition::CURRENT,
     )
     .ok()
     .unwrap();
     let module = file.syntax().descendants().find_map(Module::cast).unwrap();
-    assert_eq!(" doc comment", module.doc_comments().doc_comment_text().unwrap());
+    assert_eq!(" doc comment", doc_comment_text(module).unwrap());
 }
 
 #[test]
@@ -314,6 +384,7 @@ where
    for<'a> F: Fn(&'a str)
 {}
         "#,
+        parser::Edition::CURRENT,
     )
     .ok()
     .unwrap();
@@ -324,8 +395,7 @@ where
     let pred = predicates.next().unwrap();
     let mut bounds = pred.type_bound_list().unwrap().bounds();
 
-    assert!(pred.for_token().is_none());
-    assert!(pred.generic_param_list().is_none());
+    assert!(pred.for_binder().is_none());
     assert_eq!("T", pred.ty().unwrap().syntax().text().to_string());
     assert_bound("Clone", bounds.next());
     assert_bound("Copy", bounds.next());
@@ -363,8 +433,10 @@ where
     let pred = predicates.next().unwrap();
     let mut bounds = pred.type_bound_list().unwrap().bounds();
 
-    assert!(pred.for_token().is_some());
-    assert_eq!("<'a>", pred.generic_param_list().unwrap().syntax().text().to_string());
+    assert_eq!(
+        "<'a>",
+        pred.for_binder().unwrap().generic_param_list().unwrap().syntax().text().to_string()
+    );
     assert_eq!("F", pred.ty().unwrap().syntax().text().to_string());
     assert_bound("Fn(&'a str)", bounds.next());
 }

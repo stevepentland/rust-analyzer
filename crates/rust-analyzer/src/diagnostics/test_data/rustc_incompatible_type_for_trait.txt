@@ -23,9 +23,7 @@
                 },
             },
             severity: Some(
-                DiagnosticSeverity(
-                    1,
-                ),
+                Error,
             ),
             code: Some(
                 String(
@@ -56,11 +54,13 @@
             source: Some(
                 "rustc",
             ),
-            message: "method `next` has an incompatible type for trait\nexpected type `fn(&mut ty::list_iter::ListIterator<'list, M>) -> std::option::Option<&ty::Ref<M>>`\n   found type `fn(&ty::list_iter::ListIterator<'list, M>) -> std::option::Option<&'list ty::Ref<M>>`",
-            related_information: None,
+            message: String(
+                "method `next` has an incompatible type for trait\nexpected type `fn(&mut ty::list_iter::ListIterator<'list, M>) -> std::option::Option<&ty::Ref<M>>`\n   found type `fn(&ty::list_iter::ListIterator<'list, M>) -> std::option::Option<&'list ty::Ref<M>>`",
+            ),
             tags: None,
+            related_information: None,
             data: None,
         },
-        fixes: [],
+        fix: None,
     },
 ]

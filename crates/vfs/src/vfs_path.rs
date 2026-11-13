@@ -1,7 +1,7 @@
 //! Abstract-ish representation of paths for VFS.
 use std::fmt;
 
-use paths::{AbsPath, AbsPathBuf};
+use paths::{AbsPath, AbsPathBuf, RelPath};
 
 /// Path in [`Vfs`].
 ///
@@ -39,6 +39,13 @@ impl VfsPath {
         }
     }
 
+    pub fn into_abs_path(self) -> Option<AbsPathBuf> {
+        match self.0 {
+            VfsPathRepr::PathBuf(it) => Some(it),
+            VfsPathRepr::VirtualPath(_) => None,
+        }
+    }
+
     /// Creates a new `VfsPath` with `path` adjoined to `self`.
     pub fn join(&self, path: &str) -> Option<VfsPath> {
         match &self.0 {
@@ -59,7 +66,7 @@ impl VfsPath {
     ///
     /// # Example
     ///
-    /// ```
+    /// ```ignore
     /// # use vfs::{AbsPathBuf, VfsPath};
     /// let mut path = VfsPath::from(AbsPathBuf::assert("/foo/bar".into()));
     /// assert!(path.pop());
@@ -84,25 +91,26 @@ impl VfsPath {
         }
     }
 
+    pub fn strip_prefix(&self, other: &VfsPath) -> Option<&RelPath> {
+        match (&self.0, &other.0) {
+            (VfsPathRepr::PathBuf(lhs), VfsPathRepr::PathBuf(rhs)) => lhs.strip_prefix(rhs),
+            (VfsPathRepr::VirtualPath(lhs), VfsPathRepr::VirtualPath(rhs)) => lhs.strip_prefix(rhs),
+            (VfsPathRepr::PathBuf(_) | VfsPathRepr::VirtualPath(_), _) => None,
+        }
+    }
+
     /// Returns the `VfsPath` without its final component, if there is one.
     ///
     /// Returns [`None`] if the path is a root or prefix.
     pub fn parent(&self) -> Option<VfsPath> {
         let mut parent = self.clone();
-        if parent.pop() {
-            Some(parent)
-        } else {
-            None
-        }
+        if parent.pop() { Some(parent) } else { None }
     }
 
     /// Returns `self`'s base name and file extension.
     pub fn name_and_extension(&self) -> Option<(&str, Option<&str>)> {
         match &self.0 {
-            VfsPathRepr::PathBuf(p) => Some((
-                p.file_stem()?.to_str()?,
-                p.extension().and_then(|extension| extension.to_str()),
-            )),
+            VfsPathRepr::PathBuf(p) => p.name_and_extension(),
             VfsPathRepr::VirtualPath(p) => p.name_and_extension(),
         }
     }
@@ -126,7 +134,6 @@ impl VfsPath {
                 #[cfg(windows)]
                 {
                     use windows_paths::Encode;
-                    let path: &std::path::Path = path.as_ref();
                     let components = path.components();
                     let mut add_sep = false;
                     for component in components {
@@ -135,30 +142,25 @@ impl VfsPath {
                         }
                         let len_before = buf.len();
                         match component {
-                            std::path::Component::Prefix(prefix) => {
+                            paths::Utf8Component::Prefix(prefix) => {
                                 // kind() returns a normalized and comparable path prefix.
                                 prefix.kind().encode(buf);
                             }
-                            std::path::Component::RootDir => {
+                            paths::Utf8Component::RootDir => {
                                 if !add_sep {
-                                    component.as_os_str().encode(buf);
+                                    component.as_str().encode(buf);
                                 }
                             }
-                            _ => component.as_os_str().encode(buf),
+                            _ => component.as_str().encode(buf),
                         }
 
                         // some components may be encoded empty
                         add_sep = len_before != buf.len();
                     }
                 }
-                #[cfg(unix)]
+                #[cfg(not(windows))]
                 {
-                    use std::os::unix::ffi::OsStrExt;
-                    buf.extend(path.as_os_str().as_bytes());
-                }
-                #[cfg(not(any(windows, unix)))]
-                {
-                    buf.extend(path.as_os_str().to_string_lossy().as_bytes());
+                    buf.extend(path.as_str().as_bytes());
                 }
             }
             VfsPathRepr::VirtualPath(VirtualPath(s)) => buf.extend(s.as_bytes()),
@@ -172,28 +174,15 @@ mod windows_paths {
         fn encode(&self, buf: &mut Vec<u8>);
     }
 
-    impl Encode for std::ffi::OsStr {
-        fn encode(&self, buf: &mut Vec<u8>) {
-            use std::os::windows::ffi::OsStrExt;
-            for wchar in self.encode_wide() {
-                buf.extend(wchar.to_le_bytes().iter().copied());
-            }
-        }
-    }
-
     impl Encode for u8 {
         fn encode(&self, buf: &mut Vec<u8>) {
-            let wide = *self as u16;
-            buf.extend(wide.to_le_bytes().iter().copied())
+            buf.push(*self);
         }
     }
 
     impl Encode for &str {
         fn encode(&self, buf: &mut Vec<u8>) {
-            debug_assert!(self.is_ascii());
-            for b in self.as_bytes() {
-                b.encode(buf)
-            }
+            buf.extend(self.as_bytes());
         }
     }
 
@@ -203,14 +192,14 @@ mod windows_paths {
     const DEVICE: &str = "\\\\.\\";
     const COLON: &str = ":";
 
-    impl Encode for std::path::Prefix<'_> {
+    impl Encode for paths::Utf8Prefix<'_> {
         fn encode(&self, buf: &mut Vec<u8>) {
             match self {
-                std::path::Prefix::Verbatim(c) => {
+                paths::Utf8Prefix::Verbatim(c) => {
                     VERBATIM.encode(buf);
                     c.encode(buf);
                 }
-                std::path::Prefix::VerbatimUNC(server, share) => {
+                paths::Utf8Prefix::VerbatimUNC(server, share) => {
                     VERBATIM.encode(buf);
                     UNC.encode(buf);
                     SEP.encode(buf);
@@ -218,23 +207,23 @@ mod windows_paths {
                     SEP.encode(buf);
                     share.encode(buf);
                 }
-                std::path::Prefix::VerbatimDisk(d) => {
+                paths::Utf8Prefix::VerbatimDisk(d) => {
                     VERBATIM.encode(buf);
                     d.encode(buf);
                     COLON.encode(buf);
                 }
-                std::path::Prefix::DeviceNS(device) => {
+                paths::Utf8Prefix::DeviceNS(device) => {
                     DEVICE.encode(buf);
                     device.encode(buf);
                 }
-                std::path::Prefix::UNC(server, share) => {
+                paths::Utf8Prefix::UNC(server, share) => {
                     SEP.encode(buf);
                     SEP.encode(buf);
                     server.encode(buf);
                     SEP.encode(buf);
                     share.encode(buf);
                 }
-                std::path::Prefix::Disk(d) => {
+                paths::Utf8Prefix::Disk(d) => {
                     d.encode(buf);
                     COLON.encode(buf);
                 }
@@ -261,7 +250,7 @@ mod windows_paths {
     fn test_sep_root_dir_encoding() {
         let mut buf = Vec::new();
         vfs("C:/x/y").encode(&mut buf);
-        assert_eq!(&buf, &[0, 67, 0, 58, 0, 92, 0, 120, 0, 92, 0, 121, 0])
+        assert_eq!(&buf, &[0, 67, 58, 92, 120, 92, 121])
     }
 
     #[cfg(test)]
@@ -287,8 +276,8 @@ impl From<AbsPathBuf> for VfsPath {
 impl fmt::Display for VfsPath {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match &self.0 {
-            VfsPathRepr::PathBuf(it) => fmt::Display::fmt(&it.display(), f),
-            VfsPathRepr::VirtualPath(VirtualPath(it)) => fmt::Display::fmt(it, f),
+            VfsPathRepr::PathBuf(it) => it.fmt(f),
+            VfsPathRepr::VirtualPath(VirtualPath(it)) => it.fmt(f),
         }
     }
 }
@@ -302,9 +291,23 @@ impl fmt::Debug for VfsPath {
 impl fmt::Debug for VfsPathRepr {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match &self {
-            VfsPathRepr::PathBuf(it) => fmt::Debug::fmt(&it.display(), f),
-            VfsPathRepr::VirtualPath(VirtualPath(it)) => fmt::Debug::fmt(&it, f),
+            VfsPathRepr::PathBuf(it) => it.fmt(f),
+            VfsPathRepr::VirtualPath(VirtualPath(it)) => it.fmt(f),
         }
+    }
+}
+
+impl PartialEq<AbsPath> for VfsPath {
+    fn eq(&self, other: &AbsPath) -> bool {
+        match &self.0 {
+            VfsPathRepr::PathBuf(lhs) => lhs == other,
+            VfsPathRepr::VirtualPath(_) => false,
+        }
+    }
+}
+impl PartialEq<VfsPath> for AbsPath {
+    fn eq(&self, other: &VfsPath) -> bool {
+        other == self
     }
 }
 
@@ -315,9 +318,16 @@ impl fmt::Debug for VfsPathRepr {
 struct VirtualPath(String);
 
 impl VirtualPath {
-    /// Returns `true` if `other` is a prefix of `self` (as strings).
+    /// Returns `true` if `other` is a prefix of `self`.
     fn starts_with(&self, other: &VirtualPath) -> bool {
-        self.0.starts_with(&other.0)
+        <_ as AsRef<paths::Utf8Path>>::as_ref(&self.0).starts_with(&other.0)
+    }
+
+    fn strip_prefix(&self, base: &VirtualPath) -> Option<&RelPath> {
+        <_ as AsRef<paths::Utf8Path>>::as_ref(&self.0)
+            .strip_prefix(&base.0)
+            .ok()
+            .map(RelPath::new_unchecked)
     }
 
     /// Remove the last component of `self`.
@@ -364,7 +374,7 @@ impl VirtualPath {
             path = &path["../".len()..];
         }
         path = path.trim_start_matches("./");
-        res.0 = format!("{}/{}", res.0, path);
+        res.0 = format!("{}/{path}", res.0);
         Some(res)
     }
 
@@ -372,8 +382,7 @@ impl VirtualPath {
     ///
     /// # Returns
     /// - `None` if `self` ends with `"//"`.
-    /// - `Some((name, None))` if `self`'s base contains no `.`, or only one `.` at
-    /// the start.
+    /// - `Some((name, None))` if `self`'s base contains no `.`, or only one `.` at the start.
     /// - `Some((name, Some(extension))` else.
     ///
     /// # Note

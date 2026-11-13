@@ -3,36 +3,54 @@
 //! interface, although it contains some code to bridge `SyntaxNode`s and
 //! `TokenTree`s as well!
 //!
-//! The tes for this functionality live in another crate:
+//! The tests for this functionality live in another crate:
 //! `hir_def::macro_expansion_tests::mbe`.
 
-mod parser;
+#![cfg_attr(feature = "in-rust-tree", feature(rustc_private))]
+
+#[cfg(not(feature = "in-rust-tree"))]
+extern crate ra_ap_rustc_lexer as rustc_lexer;
+#[cfg(feature = "in-rust-tree")]
+extern crate rustc_lexer;
+
 mod expander;
-mod syntax_bridge;
-mod tt_iter;
-mod subtree_source;
+mod macro_call_style;
+mod parser;
 
 #[cfg(test)]
 mod benchmark;
-mod token_map;
+#[cfg(test)]
+mod tests;
+
+use span::{Edition, Span, SyntaxContext};
+use syntax_bridge::to_parser_input;
+use tt::DelimSpan;
+use tt::iter::TtIter;
 
 use std::fmt;
+use std::sync::Arc;
 
-use crate::{
-    parser::{MetaTemplate, Op},
-    tt_iter::TtIter,
-};
+pub use crate::macro_call_style::{MacroCallStyle, MacroCallStyles};
+use crate::parser::{MetaTemplate, MetaVarKind, Op};
 
-// FIXME: we probably should re-think  `token_tree_to_syntax_node` interfaces
-pub use ::parser::ParserEntryPoint;
 pub use tt::{Delimiter, DelimiterKind, Punct};
 
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub enum ParseError {
-    UnexpectedToken(String),
-    Expected(String),
+    UnexpectedToken(Box<str>),
+    Expected(Box<str>),
     InvalidRepeat,
     RepetitionEmptyTokenTree,
+}
+
+impl ParseError {
+    fn expected(e: &str) -> ParseError {
+        ParseError::Expected(e.into())
+    }
+
+    fn unexpected(e: &str) -> ParseError {
+        ParseError::UnexpectedToken(e.into())
+    }
 }
 
 impl fmt::Display for ParseError {
@@ -46,37 +64,68 @@ impl fmt::Display for ParseError {
     }
 }
 
-#[derive(Debug, PartialEq, Eq, Clone)]
-pub enum ExpandError {
+#[derive(Debug, PartialEq, Eq, Clone, Hash)]
+pub struct ExpandError {
+    pub inner: Arc<(Span, ExpandErrorKind)>,
+}
+#[derive(Debug, PartialEq, Eq, Clone, Hash)]
+pub enum ExpandErrorKind {
+    BindingError(Box<Box<str>>),
+    UnresolvedBinding(Box<Box<str>>),
+    LeftoverTokens,
+    LimitExceeded,
     NoMatchingRule,
     UnexpectedToken,
-    BindingError(String),
-    ConversionError,
-    // FIXME: no way mbe should know about proc macros.
-    UnresolvedProcMacro,
-    Other(String),
 }
 
+impl ExpandError {
+    fn new(span: Span, kind: ExpandErrorKind) -> ExpandError {
+        ExpandError { inner: Arc::new((span, kind)) }
+    }
+    fn binding_error(span: Span, e: impl Into<Box<str>>) -> ExpandError {
+        ExpandError { inner: Arc::new((span, ExpandErrorKind::BindingError(Box::new(e.into())))) }
+    }
+}
 impl fmt::Display for ExpandError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.inner.1.fmt(f)
+    }
+}
+
+impl fmt::Display for ExpandErrorKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            ExpandError::NoMatchingRule => f.write_str("no rule matches input tokens"),
-            ExpandError::UnexpectedToken => f.write_str("unexpected token in input"),
-            ExpandError::BindingError(e) => f.write_str(e),
-            ExpandError::ConversionError => f.write_str("could not convert tokens"),
-            ExpandError::UnresolvedProcMacro => f.write_str("unresolved proc macro"),
-            ExpandError::Other(e) => f.write_str(e),
+            ExpandErrorKind::NoMatchingRule => f.write_str("no rule matches input tokens"),
+            ExpandErrorKind::UnexpectedToken => f.write_str("unexpected token in input"),
+            ExpandErrorKind::BindingError(e) => f.write_str(e),
+            ExpandErrorKind::UnresolvedBinding(binding) => {
+                f.write_str("could not find binding ")?;
+                f.write_str(binding)
+            }
+            ExpandErrorKind::LimitExceeded => f.write_str("Expand exceed limit"),
+            ExpandErrorKind::LeftoverTokens => f.write_str("leftover tokens"),
         }
     }
 }
 
-pub use crate::{
-    syntax_bridge::{
-        parse_exprs_with_sep, parse_to_token_tree, syntax_node_to_token_tree,
-        syntax_node_to_token_tree_censored, token_tree_to_syntax_node,
-    },
-    token_map::TokenMap,
-};
+// FIXME: Showing these errors could be nicer.
+#[derive(Debug, PartialEq, Eq, Clone, Hash)]
+pub enum CountError {
+    OutOfBounds,
+    Misplaced,
+}
+
+impl fmt::Display for CountError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            CountError::OutOfBounds => f.write_str("${count} out of bounds"),
+            CountError::Misplaced => f.write_str("${count} misplaced"),
+        }
+    }
+}
+
+/// Index of the matched macro arm on successful expansion.
+pub type MatchedArmIndex = Option<u32>;
 
 /// This struct contains AST for a single `macro_rules` definition. What might
 /// be very confusing is that AST has almost exactly the same shape as
@@ -84,186 +133,177 @@ pub use crate::{
 /// and `$()*` have special meaning (see `Var` and `Repeat` data structures)
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DeclarativeMacro {
-    rules: Vec<Rule>,
-    /// Highest id of the token we have in TokenMap
-    shift: Shift,
+    rules: Box<[Rule]>,
+    err: Option<Box<ParseError>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Rule {
+    /// Is this a normal fn-like rule, an `attr()` rule, or a `derive()` rule?
+    style: MacroCallStyle,
     lhs: MetaTemplate,
     rhs: MetaTemplate,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct Shift(u32);
-
-impl Shift {
-    pub fn new(tt: &tt::Subtree) -> Shift {
-        // Note that TokenId is started from zero,
-        // We have to add 1 to prevent duplication.
-        let value = max_id(tt).map_or(0, |it| it + 1);
-        return Shift(value);
-
-        // Find the max token id inside a subtree
-        fn max_id(subtree: &tt::Subtree) -> Option<u32> {
-            subtree
-                .token_trees
-                .iter()
-                .filter_map(|tt| match tt {
-                    tt::TokenTree::Subtree(subtree) => {
-                        let tree_id = max_id(subtree);
-                        match subtree.delimiter {
-                            Some(it) if it.id != tt::TokenId::unspecified() => {
-                                Some(tree_id.map_or(it.id.0, |t| t.max(it.id.0)))
-                            }
-                            _ => tree_id,
-                        }
-                    }
-                    tt::TokenTree::Leaf(tt::Leaf::Ident(ident))
-                        if ident.id != tt::TokenId::unspecified() =>
-                    {
-                        Some(ident.id.0)
-                    }
-                    _ => None,
-                })
-                .max()
-        }
-    }
-
-    /// Shift given TokenTree token id
-    pub fn shift_all(self, tt: &mut tt::Subtree) {
-        for t in &mut tt.token_trees {
-            match t {
-                tt::TokenTree::Leaf(leaf) => match leaf {
-                    tt::Leaf::Ident(ident) => ident.id = self.shift(ident.id),
-                    tt::Leaf::Punct(punct) => punct.id = self.shift(punct.id),
-                    tt::Leaf::Literal(lit) => lit.id = self.shift(lit.id),
-                },
-                tt::TokenTree::Subtree(tt) => {
-                    if let Some(it) = tt.delimiter.as_mut() {
-                        it.id = self.shift(it.id);
-                    };
-                    self.shift_all(tt)
-                }
-            }
-        }
-    }
-
-    pub fn shift(self, id: tt::TokenId) -> tt::TokenId {
-        if id == tt::TokenId::unspecified() {
-            return id;
-        }
-        tt::TokenId(id.0 + self.0)
-    }
-
-    pub fn unshift(self, id: tt::TokenId) -> Option<tt::TokenId> {
-        id.0.checked_sub(self.0).map(tt::TokenId)
-    }
-}
-
-#[derive(Debug, Eq, PartialEq)]
-pub enum Origin {
-    Def,
-    Call,
-}
-
 impl DeclarativeMacro {
+    pub fn from_err(err: ParseError) -> DeclarativeMacro {
+        DeclarativeMacro { rules: Box::default(), err: Some(Box::new(err)) }
+    }
+
     /// The old, `macro_rules! m {}` flavor.
-    pub fn parse_macro_rules(tt: &tt::Subtree) -> Result<DeclarativeMacro, ParseError> {
+    pub fn parse_macro_rules(
+        tt: &tt::TopSubtree,
+        ctx_edition: impl Copy + Fn(SyntaxContext) -> Edition,
+    ) -> DeclarativeMacro {
         // Note: this parsing can be implemented using mbe machinery itself, by
         // matching against `$($lhs:tt => $rhs:tt);*` pattern, but implementing
         // manually seems easier.
-        let mut src = TtIter::new(tt);
+        let mut src = tt.iter();
         let mut rules = Vec::new();
-        while src.len() > 0 {
-            let rule = Rule::parse(&mut src, true)?;
+        let mut err = None;
+
+        while !src.is_empty() {
+            let rule = match Rule::parse(ctx_edition, &mut src) {
+                Ok(it) => it,
+                Err(e) => {
+                    err = Some(Box::new(e));
+                    break;
+                }
+            };
             rules.push(rule);
             if let Err(()) = src.expect_char(';') {
-                if src.len() > 0 {
-                    return Err(ParseError::Expected("expected `;`".to_string()));
+                if !src.is_empty() {
+                    err = Some(Box::new(ParseError::expected("expected `;`")));
                 }
                 break;
             }
         }
 
-        for rule in &rules {
-            validate(&rule.lhs)?;
+        for Rule { lhs, .. } in &rules {
+            if let Err(e) = validate(lhs) {
+                err = Some(Box::new(e));
+                break;
+            }
         }
 
-        Ok(DeclarativeMacro { rules, shift: Shift::new(tt) })
+        DeclarativeMacro { rules: rules.into_boxed_slice(), err }
     }
 
     /// The new, unstable `macro m {}` flavor.
-    pub fn parse_macro2(tt: &tt::Subtree) -> Result<DeclarativeMacro, ParseError> {
-        let mut src = TtIter::new(tt);
+    pub fn parse_macro2(
+        args: Option<&tt::TopSubtree>,
+        body: &tt::TopSubtree,
+        ctx_edition: impl Copy + Fn(SyntaxContext) -> Edition,
+    ) -> DeclarativeMacro {
         let mut rules = Vec::new();
+        let mut err = None;
 
-        if Some(tt::DelimiterKind::Brace) == tt.delimiter_kind() {
+        if let Some(args) = args {
+            // The presence of an argument list means that this macro uses the
+            // "simple" syntax, where the body is the RHS of a single rule.
+            cov_mark::hit!(parse_macro_def_simple);
+
+            let rule = (|| {
+                let lhs = MetaTemplate::parse_pattern(ctx_edition, args.iter())?;
+                let rhs = MetaTemplate::parse_template(ctx_edition, body.iter())?;
+
+                // In the "simple" syntax, there is apparently no way to specify
+                // that the single rule is an attribute or derive rule, so it
+                // must be a function-like rule.
+                Ok(crate::Rule { style: MacroCallStyle::FnLike, lhs, rhs })
+            })();
+
+            match rule {
+                Ok(rule) => rules.push(rule),
+                Err(e) => err = Some(Box::new(e)),
+            }
+        } else {
+            // There was no top-level argument list, so this macro uses the
+            // list-of-rules syntax, similar to `macro_rules!`.
             cov_mark::hit!(parse_macro_def_rules);
-            while src.len() > 0 {
-                let rule = Rule::parse(&mut src, true)?;
+            let mut src = body.iter();
+            while !src.is_empty() {
+                let rule = match Rule::parse(ctx_edition, &mut src) {
+                    Ok(it) => it,
+                    Err(e) => {
+                        err = Some(Box::new(e));
+                        break;
+                    }
+                };
                 rules.push(rule);
                 if let Err(()) = src.expect_any_char(&[';', ',']) {
-                    if src.len() > 0 {
-                        return Err(ParseError::Expected(
-                            "expected `;` or `,` to delimit rules".to_string(),
-                        ));
+                    if !src.is_empty() {
+                        err = Some(Box::new(ParseError::expected(
+                            "expected `;` or `,` to delimit rules",
+                        )));
                     }
                     break;
                 }
             }
-        } else {
-            cov_mark::hit!(parse_macro_def_simple);
-            let rule = Rule::parse(&mut src, false)?;
-            if src.len() != 0 {
-                return Err(ParseError::Expected("remain tokens in macro def".to_string()));
+        }
+
+        for Rule { lhs, .. } in &rules {
+            if let Err(e) = validate(lhs) {
+                err = Some(Box::new(e));
+                break;
             }
-            rules.push(rule);
-        }
-        for rule in &rules {
-            validate(&rule.lhs)?;
         }
 
-        Ok(DeclarativeMacro { rules, shift: Shift::new(tt) })
+        DeclarativeMacro { rules: rules.into_boxed_slice(), err }
     }
 
-    pub fn expand(&self, tt: &tt::Subtree) -> ExpandResult<tt::Subtree> {
-        // apply shift
-        let mut tt = tt.clone();
-        self.shift.shift_all(&mut tt);
-        expander::expand_rules(&self.rules, &tt)
+    pub fn err(&self) -> Option<&ParseError> {
+        self.err.as_deref()
     }
 
-    pub fn map_id_down(&self, id: tt::TokenId) -> tt::TokenId {
-        self.shift.shift(id)
+    pub fn num_rules(&self) -> usize {
+        self.rules.len()
     }
 
-    pub fn map_id_up(&self, id: tt::TokenId) -> (tt::TokenId, Origin) {
-        match self.shift.unshift(id) {
-            Some(id) => (id, Origin::Call),
-            None => (id, Origin::Def),
+    pub fn rule_styles(&self) -> MacroCallStyles {
+        if self.rules.is_empty() {
+            // No rules could be parsed, so fall back to assuming that this
+            // is intended to be a function-like macro.
+            MacroCallStyles::FN_LIKE
+        } else {
+            self.rules
+                .iter()
+                .map(|rule| MacroCallStyles::from(rule.style))
+                .fold(MacroCallStyles::empty(), |a, b| a | b)
         }
+    }
+
+    pub fn expand(
+        &self,
+        db: &dyn salsa::Database,
+        tt: &tt::TopSubtree,
+        marker: impl Fn(&mut Span) + Copy,
+        call_style: MacroCallStyle,
+        call_site: Span,
+    ) -> ExpandResult<(tt::TopSubtree, MatchedArmIndex)> {
+        expander::expand_rules(db, &self.rules, tt, marker, call_style, call_site)
     }
 }
 
 impl Rule {
-    fn parse(src: &mut TtIter, expect_arrow: bool) -> Result<Self, ParseError> {
-        let lhs = src
-            .expect_subtree()
-            .map_err(|()| ParseError::Expected("expected subtree".to_string()))?;
-        if expect_arrow {
-            src.expect_char('=').map_err(|()| ParseError::Expected("expected `=`".to_string()))?;
-            src.expect_char('>').map_err(|()| ParseError::Expected("expected `>`".to_string()))?;
-        }
-        let rhs = src
-            .expect_subtree()
-            .map_err(|()| ParseError::Expected("expected subtree".to_string()))?;
+    fn parse(
+        edition: impl Copy + Fn(SyntaxContext) -> Edition,
+        src: &mut TtIter<'_>,
+    ) -> Result<Self, ParseError> {
+        // Parse an optional `attr()` or `derive()` prefix before the LHS pattern.
+        let style = parser::parse_rule_style(src)?;
 
-        let lhs = MetaTemplate::parse_pattern(lhs)?;
-        let rhs = MetaTemplate::parse_template(rhs)?;
+        let (_, lhs) =
+            src.expect_subtree().map_err(|()| ParseError::expected("expected subtree"))?;
+        src.expect_char('=').map_err(|()| ParseError::expected("expected `=`"))?;
+        src.expect_char('>').map_err(|()| ParseError::expected("expected `>`"))?;
+        let (_, rhs) =
+            src.expect_subtree().map_err(|()| ParseError::expected("expected subtree"))?;
 
-        Ok(crate::Rule { lhs, rhs })
+        let lhs = MetaTemplate::parse_pattern(edition, lhs)?;
+        let rhs = MetaTemplate::parse_template(edition, rhs)?;
+
+        Ok(crate::Rule { style, lhs, rhs })
     }
 }
 
@@ -274,28 +314,18 @@ fn validate(pattern: &MetaTemplate) -> Result<(), ParseError> {
             Op::Repeat { tokens: subtree, separator, .. } => {
                 // Checks that no repetition which could match an empty token
                 // https://github.com/rust-lang/rust/blob/a58b1ed44f5e06976de2bdc4d7dc81c36a96934f/src/librustc_expand/mbe/macro_rules.rs#L558
-
-                if separator.is_none()
-                    && subtree.iter().all(|child_op| {
-                        match child_op {
-                            Op::Var { kind, .. } => {
-                                // vis is optional
-                                if kind.as_ref().map_or(false, |it| it == "vis") {
-                                    return true;
-                                }
-                            }
-                            Op::Repeat { kind, .. } => {
-                                return matches!(
-                                    kind,
-                                    parser::RepeatKind::ZeroOrMore | parser::RepeatKind::ZeroOrOne
-                                )
-                            }
-                            Op::Leaf(_) => {}
-                            Op::Subtree { .. } => {}
-                        }
-                        false
-                    })
-                {
+                let lsh_is_empty_seq = separator.is_none() && subtree.iter().all(|child_op| {
+                    match *child_op {
+                        // vis is optional
+                        Op::Var { kind: Some(kind), .. } => kind == MetaVarKind::Vis,
+                        Op::Repeat {
+                            kind: parser::RepeatKind::ZeroOrMore | parser::RepeatKind::ZeroOrOne,
+                            ..
+                        } => true,
+                        _ => false,
+                    }
+                });
+                if lsh_is_empty_seq {
                     return Err(ParseError::RepetitionEmptyTokenTree);
                 }
                 validate(subtree)?
@@ -306,42 +336,113 @@ fn validate(pattern: &MetaTemplate) -> Result<(), ParseError> {
     Ok(())
 }
 
+pub type ExpandResult<T> = ValueResult<T, ExpandError>;
+
 #[derive(Debug, Clone, Eq, PartialEq)]
-pub struct ExpandResult<T> {
+pub struct ValueResult<T, E> {
     pub value: T,
-    pub err: Option<ExpandError>,
+    pub err: Option<E>,
 }
 
-impl<T> ExpandResult<T> {
+impl<T: Default, E> Default for ValueResult<T, E> {
+    fn default() -> Self {
+        Self { value: Default::default(), err: Default::default() }
+    }
+}
+
+impl<T, E> ValueResult<T, E> {
+    pub fn new(value: T, err: E) -> Self {
+        Self { value, err: Some(err) }
+    }
+
     pub fn ok(value: T) -> Self {
         Self { value, err: None }
     }
 
-    pub fn only_err(err: ExpandError) -> Self
+    pub fn only_err(err: E) -> Self
     where
         T: Default,
     {
         Self { value: Default::default(), err: Some(err) }
     }
 
-    pub fn str_err(err: String) -> Self
+    pub fn zip_val<U>(self, other: U) -> ValueResult<(T, U), E> {
+        ValueResult { value: (self.value, other), err: self.err }
+    }
+
+    pub fn map<U>(self, f: impl FnOnce(T) -> U) -> ValueResult<U, E> {
+        ValueResult { value: f(self.value), err: self.err }
+    }
+
+    pub fn as_ref(&self) -> ValueResult<&T, E>
     where
-        T: Default,
+        E: Clone,
     {
-        Self::only_err(ExpandError::Other(err))
+        ValueResult { value: &self.value, err: self.err.clone() }
     }
 
-    pub fn map<U>(self, f: impl FnOnce(T) -> U) -> ExpandResult<U> {
-        ExpandResult { value: f(self.value), err: self.err }
+    pub fn map_err<E2>(self, f: impl FnOnce(E) -> E2) -> ValueResult<T, E2> {
+        ValueResult { value: self.value, err: self.err.map(f) }
     }
 
-    pub fn result(self) -> Result<T, ExpandError> {
+    pub fn result(self) -> Result<T, E> {
         self.err.map_or(Ok(self.value), Err)
     }
 }
 
-impl<T: Default> From<Result<T, ExpandError>> for ExpandResult<T> {
-    fn from(result: Result<T, ExpandError>) -> Self {
+impl<T: Default, E> From<Result<T, E>> for ValueResult<T, E> {
+    fn from(result: Result<T, E>) -> Self {
         result.map_or_else(Self::only_err, Self::ok)
     }
+}
+
+pub fn expect_fragment<'t>(
+    db: &dyn salsa::Database,
+    tt_iter: &mut TtIter<'t>,
+    entry_point: ::parser::PrefixEntryPoint,
+    delim_span: DelimSpan,
+) -> ExpandResult<tt::TokenTreesView<'t>> {
+    use ::parser;
+    let buffer = tt_iter.remaining();
+    let parser_input = to_parser_input(buffer, &mut |ctx| ctx.edition(db));
+    let tree_traversal = entry_point.parse(&parser_input);
+    let mut cursor = buffer.cursor();
+    let mut error = false;
+    for step in tree_traversal.iter() {
+        match step {
+            parser::Step::Token { kind, mut n_input_tokens } => {
+                if kind == ::parser::SyntaxKind::LIFETIME_IDENT {
+                    n_input_tokens = 2;
+                }
+                for _ in 0..n_input_tokens {
+                    cursor.bump_or_end();
+                }
+            }
+            parser::Step::FloatSplit { .. } => {
+                // FIXME: We need to split the tree properly here, but mutating the token trees
+                // in the buffer is somewhat tricky to pull off.
+                cursor.bump_or_end();
+            }
+            parser::Step::Enter { .. } | parser::Step::Exit => (),
+            parser::Step::Error { .. } => error = true,
+        }
+    }
+
+    let err = if error || !cursor.is_root() {
+        Some(ExpandError::binding_error(
+            buffer.cursor().token_tree().map_or(delim_span.close, |tt| tt.first_span()),
+            format!("expected {entry_point:?}"),
+        ))
+    } else {
+        None
+    };
+
+    while !cursor.is_root() {
+        cursor.bump_or_end();
+    }
+
+    let res = cursor.crossed();
+    tt_iter.flat_advance_to(&cursor);
+
+    ExpandResult { value: res, err }
 }

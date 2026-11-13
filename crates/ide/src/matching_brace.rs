@@ -1,6 +1,6 @@
 use syntax::{
+    SourceFile, SyntaxKind, T, TextSize,
     ast::{self, AstNode},
-    SourceFile, SyntaxKind, TextSize, T,
 };
 
 // Feature: Matching Brace
@@ -9,35 +9,45 @@ use syntax::{
 // moves cursor to the matching brace. It uses the actual parser to determine
 // braces, so it won't confuse generics with comparisons.
 //
-// |===
-// | Editor  | Action Name
+// | Editor  | Action Name |
+// |---------|-------------|
+// | VS Code | **rust-analyzer: Find matching brace** |
 //
-// | VS Code | **Rust Analyzer: Find matching brace**
-// |===
-//
-// image::https://user-images.githubusercontent.com/48062697/113065573-04298180-91b1-11eb-8dec-d4e2a202f304.gif[]
+// ![Matching Brace](https://user-images.githubusercontent.com/48062697/113065573-04298180-91b1-11eb-8dec-d4e2a202f304.gif)
 pub(crate) fn matching_brace(file: &SourceFile, offset: TextSize) -> Option<TextSize> {
     const BRACES: &[SyntaxKind] =
         &[T!['{'], T!['}'], T!['['], T![']'], T!['('], T![')'], T![<], T![>], T![|], T![|]];
-    let (brace_token, brace_idx) = file
-        .syntax()
-        .token_at_offset(offset)
+    let current = file.syntax().token_at_offset(offset);
+    if let Some((brace_token, brace_idx)) = current
+        .clone()
         .filter_map(|node| {
             let idx = BRACES.iter().position(|&brace| brace == node.kind())?;
             Some((node, idx))
         })
-        .last()?;
-    let parent = brace_token.parent()?;
-    if brace_token.kind() == T![|] && !ast::ParamList::can_cast(parent.kind()) {
-        cov_mark::hit!(pipes_not_braces);
-        return None;
+        .last()
+    {
+        let parent = brace_token.parent()?;
+        if brace_token.kind() == T![|] && !ast::ParamList::can_cast(parent.kind()) {
+            cov_mark::hit!(pipes_not_braces);
+            return None;
+        }
+        let matching_kind = BRACES[brace_idx ^ 1];
+        let matching_node = parent
+            .children_with_tokens()
+            .filter_map(|it| it.into_token())
+            .find(|node| node.kind() == matching_kind && node != &brace_token)?;
+        Some(matching_node.text_range().start())
+    } else {
+        // when the offset is not at a brace, find first parent
+        current.last()?.parent_ancestors().find_map(|x| {
+            x.children_with_tokens()
+                .filter_map(|it| it.into_token())
+                // with ending brace
+                .filter(|node| BRACES.contains(&node.kind()))
+                .last()
+                .map(|x| x.text_range().start())
+        })
     }
-    let matching_kind = BRACES[brace_idx ^ 1];
-    let matching_node = parent
-        .children_with_tokens()
-        .filter_map(|it| it.into_token())
-        .find(|node| node.kind() == matching_kind && node != &brace_token)?;
-    Some(matching_node.text_range().start())
 }
 
 #[cfg(test)]
@@ -50,7 +60,7 @@ mod tests {
     fn test_matching_brace() {
         fn do_check(before: &str, after: &str) {
             let (pos, before) = extract_offset(before);
-            let parse = SourceFile::parse(&before);
+            let parse = SourceFile::parse(&before, span::Edition::CURRENT);
             let new_pos = match matching_brace(&parse.tree(), pos) {
                 None => pos,
                 Some(pos) => pos,
@@ -65,6 +75,14 @@ mod tests {
         do_check(
             "fn func(x) { return (2 * (x + 3)$0) + 5;}",
             "fn func(x) { return $0(2 * (x + 3)) + 5;}",
+        );
+        do_check(
+            "fn func(x) { return (2 * (x $0+ 3)) + 5;}",
+            "fn func(x) { return (2 * (x + 3$0)) + 5;}",
+        );
+        do_check(
+            "fn func(x) { re$0turn (2 * (x + 3)) + 5;}",
+            "fn func(x) { return (2 * (x + 3)) + 5;$0}",
         );
 
         {

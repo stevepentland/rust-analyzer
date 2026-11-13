@@ -23,9 +23,7 @@
                 },
             },
             severity: Some(
-                DiagnosticSeverity(
-                    2,
-                ),
+                Warning,
             ),
             code: Some(
                 String(
@@ -56,7 +54,10 @@
             source: Some(
                 "clippy",
             ),
-            message: "returning the result of a let binding from a block\n`#[warn(clippy::let_and_return)]` on by default\nfor further information visit https://rust-lang.github.io/rust-clippy/master/index.html#let_and_return",
+            message: String(
+                "returning the result of a let binding from a block\n`#[warn(clippy::let_and_return)]` on by default\nfor further information visit https://rust-lang.github.io/rust-clippy/master/index.html#let_and_return",
+            ),
+            tags: None,
             related_information: Some(
                 [
                     DiagnosticRelatedInformation {
@@ -113,10 +114,9 @@
                     },
                 ],
             ),
-            tags: None,
             data: None,
         },
-        fixes: [],
+        fix: None,
     },
     MappedRustDiagnostic {
         url: Url {
@@ -142,9 +142,7 @@
                 },
             },
             severity: Some(
-                DiagnosticSeverity(
-                    4,
-                ),
+                Hint,
             ),
             code: Some(
                 String(
@@ -175,7 +173,10 @@
             source: Some(
                 "clippy",
             ),
-            message: "unnecessary let binding",
+            message: String(
+                "unnecessary let binding",
+            ),
+            tags: None,
             related_information: Some(
                 [
                     DiagnosticRelatedInformation {
@@ -206,10 +207,9 @@
                     },
                 ],
             ),
-            tags: None,
             data: None,
         },
-        fixes: [],
+        fix: None,
     },
     MappedRustDiagnostic {
         url: Url {
@@ -235,9 +235,7 @@
                 },
             },
             severity: Some(
-                DiagnosticSeverity(
-                    4,
-                ),
+                Hint,
             ),
             code: Some(
                 String(
@@ -268,7 +266,10 @@
             source: Some(
                 "clippy",
             ),
-            message: "return the expression directly: `(0..10).collect()`",
+            message: String(
+                "return the expression directly: `(0..10).collect()`",
+            ),
+            tags: None,
             related_information: Some(
                 [
                     DiagnosticRelatedInformation {
@@ -299,71 +300,93 @@
                     },
                 ],
             ),
-            tags: None,
             data: None,
         },
-        fixes: [
-            CodeAction {
-                title: "return the expression directly: `(0..10).collect()`",
-                group: None,
-                kind: Some(
-                    CodeActionKind(
-                        "quickfix",
+        fix: Some(
+            Fix {
+                ranges: [
+                    Range {
+                        start: Position {
+                            line: 2,
+                            character: 4,
+                        },
+                        end: Position {
+                            line: 2,
+                            character: 30,
+                        },
+                    },
+                    Range {
+                        start: Position {
+                            line: 3,
+                            character: 4,
+                        },
+                        end: Position {
+                            line: 3,
+                            character: 5,
+                        },
+                    },
+                ],
+                action: CodeAction {
+                    title: "return the expression directly: `(0..10).collect()`",
+                    group: None,
+                    kind: Some(
+                        QuickFix,
                     ),
-                ),
-                edit: Some(
-                    SnippetWorkspaceEdit {
-                        changes: Some(
-                            {
-                                Url {
-                                    scheme: "file",
-                                    cannot_be_a_base: false,
-                                    username: "",
-                                    password: None,
-                                    host: None,
-                                    port: None,
-                                    path: "/test/src/main.rs",
-                                    query: None,
-                                    fragment: None,
-                                }: [
-                                    TextEdit {
-                                        range: Range {
-                                            start: Position {
-                                                line: 2,
-                                                character: 4,
+                    command: None,
+                    edit: Some(
+                        SnippetWorkspaceEdit {
+                            changes: Some(
+                                {
+                                    Url {
+                                        scheme: "file",
+                                        cannot_be_a_base: false,
+                                        username: "",
+                                        password: None,
+                                        host: None,
+                                        port: None,
+                                        path: "/test/src/main.rs",
+                                        query: None,
+                                        fragment: None,
+                                    }: [
+                                        TextEdit {
+                                            range: Range {
+                                                start: Position {
+                                                    line: 2,
+                                                    character: 4,
+                                                },
+                                                end: Position {
+                                                    line: 2,
+                                                    character: 30,
+                                                },
                                             },
-                                            end: Position {
-                                                line: 2,
-                                                character: 30,
-                                            },
+                                            new_text: "",
                                         },
-                                        new_text: "",
-                                    },
-                                    TextEdit {
-                                        range: Range {
-                                            start: Position {
-                                                line: 3,
-                                                character: 4,
+                                        TextEdit {
+                                            range: Range {
+                                                start: Position {
+                                                    line: 3,
+                                                    character: 4,
+                                                },
+                                                end: Position {
+                                                    line: 3,
+                                                    character: 5,
+                                                },
                                             },
-                                            end: Position {
-                                                line: 3,
-                                                character: 5,
-                                            },
+                                            new_text: "(0..10).collect()",
                                         },
-                                        new_text: "(0..10).collect()",
-                                    },
-                                ],
-                            },
-                        ),
-                        document_changes: None,
-                        change_annotations: None,
-                    },
-                ),
-                is_preferred: Some(
-                    true,
-                ),
-                data: None,
+                                    ],
+                                },
+                            ),
+                            document_changes: None,
+                            change_annotations: None,
+                        },
+                    ),
+                    is_preferred: Some(
+                        true,
+                    ),
+                    data: None,
+                },
             },
-        ],
+        ),
     },
 ]

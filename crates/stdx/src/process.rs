@@ -5,58 +5,78 @@
 
 use std::{
     io,
-    process::{Command, Output, Stdio},
+    process::{ChildStderr, ChildStdout, Command, Output, Stdio},
 };
 
+use crate::JodChild;
+
 pub fn streaming_output(
+    out: ChildStdout,
+    err: ChildStderr,
+    on_stdout_line: &mut dyn FnMut(&str),
+    on_stderr_line: &mut dyn FnMut(&str),
+    on_eof: &mut dyn FnMut(),
+) -> io::Result<(Vec<u8>, Vec<u8>)> {
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+
+    imp::read2(out, err, &mut |is_out, data, eof| {
+        let idx = if eof {
+            data.len()
+        } else {
+            match data.iter().rposition(|&b| b == b'\n') {
+                Some(i) => i + 1,
+                None => return,
+            }
+        };
+        {
+            // scope for new_lines
+            let new_lines = {
+                let dst = if is_out { &mut stdout } else { &mut stderr };
+                let start = dst.len();
+                let data = data.drain(..idx);
+                dst.extend(data);
+                &dst[start..]
+            };
+            for line in String::from_utf8_lossy(new_lines).lines() {
+                if is_out {
+                    on_stdout_line(line);
+                } else {
+                    on_stderr_line(line);
+                }
+            }
+            if eof {
+                on_eof();
+            }
+        }
+    })?;
+
+    Ok((stdout, stderr))
+}
+
+/// # Panics
+///
+/// Panics if `cmd` is not configured to have `stdout` and `stderr` as `piped`.
+pub fn spawn_with_streaming_output(
     mut cmd: Command,
     on_stdout_line: &mut dyn FnMut(&str),
     on_stderr_line: &mut dyn FnMut(&str),
 ) -> io::Result<Output> {
-    let mut stdout = Vec::new();
-    let mut stderr = Vec::new();
-
     let cmd = cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).stdin(Stdio::null());
 
-    let status = {
-        let mut child = cmd.spawn()?;
-        let out = child.stdout.take().unwrap();
-        let err = child.stderr.take().unwrap();
-        imp::read2(out, err, &mut |is_out, data, eof| {
-            let idx = if eof {
-                data.len()
-            } else {
-                match data.iter().rposition(|b| *b == b'\n') {
-                    Some(i) => i + 1,
-                    None => return,
-                }
-            };
-            {
-                // scope for new_lines
-                let new_lines = {
-                    let dst = if is_out { &mut stdout } else { &mut stderr };
-                    let start = dst.len();
-                    let data = data.drain(..idx);
-                    dst.extend(data);
-                    &dst[start..]
-                };
-                for line in String::from_utf8_lossy(new_lines).lines() {
-                    if is_out {
-                        on_stdout_line(line);
-                    } else {
-                        on_stderr_line(line);
-                    }
-                }
-            }
-        })?;
-        let _ = child.kill();
-        child.wait()?
-    };
-
+    let mut child = JodChild(cmd.spawn()?);
+    let (stdout, stderr) = streaming_output(
+        child.stdout.take().unwrap(),
+        child.stderr.take().unwrap(),
+        on_stdout_line,
+        on_stderr_line,
+        &mut || (),
+    )?;
+    let status = child.wait()?;
     Ok(Output { status, stdout, stderr })
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, not(target_arch = "wasm32")))]
 mod imp {
     use std::{
         io::{self, prelude::*},
@@ -141,11 +161,11 @@ mod imp {
     };
 
     use miow::{
+        Overlapped,
         iocp::{CompletionPort, CompletionStatus},
         pipe::NamedPipe,
-        Overlapped,
     };
-    use winapi::shared::winerror::ERROR_BROKEN_PIPE;
+    use windows_sys::Win32::Foundation::ERROR_BROKEN_PIPE;
 
     struct Pipe<'a> {
         dst: &'a mut Vec<u8>,
@@ -195,17 +215,13 @@ mod imp {
 
     impl<'a> Pipe<'a> {
         unsafe fn new<P: IntoRawHandle>(p: P, dst: &'a mut Vec<u8>) -> Pipe<'a> {
-            Pipe {
-                dst,
-                pipe: NamedPipe::from_raw_handle(p.into_raw_handle()),
-                overlapped: Overlapped::zero(),
-                done: false,
-            }
+            let pipe = unsafe { NamedPipe::from_raw_handle(p.into_raw_handle()) };
+            Pipe { dst, pipe, overlapped: Overlapped::zero(), done: false }
         }
 
         unsafe fn read(&mut self) -> io::Result<()> {
-            let dst = slice_to_end(self.dst);
-            match self.pipe.read_overlapped(dst, self.overlapped.raw()) {
+            let dst = unsafe { slice_to_end(self.dst) };
+            match unsafe { self.pipe.read_overlapped(dst, self.overlapped.raw()) } {
                 Ok(_) => Ok(()),
                 Err(e) => {
                     if e.raw_os_error() == Some(ERROR_BROKEN_PIPE as i32) {
@@ -220,7 +236,7 @@ mod imp {
 
         unsafe fn complete(&mut self, status: &CompletionStatus) {
             let prev = self.dst.len();
-            self.dst.set_len(prev + status.bytes_transferred() as usize);
+            unsafe { self.dst.set_len(prev + status.bytes_transferred() as usize) };
             if status.bytes_transferred() == 0 {
                 self.done = true;
             }
@@ -234,7 +250,9 @@ mod imp {
         if v.capacity() == v.len() {
             v.reserve(1);
         }
-        slice::from_raw_parts_mut(v.as_mut_ptr().add(v.len()), v.capacity() - v.len())
+        let data = unsafe { v.as_mut_ptr().add(v.len()) };
+        let len = v.capacity() - v.len();
+        unsafe { slice::from_raw_parts_mut(data, len) }
     }
 }
 

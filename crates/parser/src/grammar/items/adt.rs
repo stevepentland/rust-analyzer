@@ -1,21 +1,23 @@
+use crate::grammar::attributes::OUTER_ATTR_FIRST;
+
 use super::*;
 
 // test struct_item
 // struct S {}
-pub(super) fn strukt(p: &mut Parser, m: Marker) {
+pub(super) fn strukt(p: &mut Parser<'_>, m: Marker) {
     p.bump(T![struct]);
     struct_or_union(p, m, true);
 }
 
 // test union_item
 // struct U { i: i32, f: f32 }
-pub(super) fn union(p: &mut Parser, m: Marker) {
-    assert!(p.at_contextual_kw("union"));
+pub(super) fn union(p: &mut Parser<'_>, m: Marker) {
+    assert!(p.at_contextual_kw(T![union]));
     p.bump_remap(T![union]);
     struct_or_union(p, m, false);
 }
 
-fn struct_or_union(p: &mut Parser, m: Marker, is_struct: bool) {
+fn struct_or_union(p: &mut Parser<'_>, m: Marker, is_struct: bool) {
     name_r(p, ITEM_RECOVERY_SET);
     generic_params::opt_generic_param_list(p);
     match p.current() {
@@ -50,7 +52,7 @@ fn struct_or_union(p: &mut Parser, m: Marker, is_struct: bool) {
     m.complete(p, if is_struct { STRUCT } else { UNION });
 }
 
-pub(super) fn enum_(p: &mut Parser, m: Marker) {
+pub(super) fn enum_(p: &mut Parser<'_>, m: Marker) {
     p.bump(T![enum]);
     name_r(p, ITEM_RECOVERY_SET);
     generic_params::opt_generic_param_list(p);
@@ -63,7 +65,7 @@ pub(super) fn enum_(p: &mut Parser, m: Marker) {
     m.complete(p, ENUM);
 }
 
-pub(crate) fn variant_list(p: &mut Parser) {
+pub(crate) fn variant_list(p: &mut Parser<'_>) {
     assert!(p.at(T!['{']));
     let m = p.start();
     p.bump(T!['{']);
@@ -80,33 +82,44 @@ pub(crate) fn variant_list(p: &mut Parser) {
     p.expect(T!['}']);
     m.complete(p, VARIANT_LIST);
 
-    fn variant(p: &mut Parser) {
+    fn variant(p: &mut Parser<'_>) {
         let m = p.start();
         attributes::outer_attrs(p);
         if p.at(IDENT) {
             name(p);
-            match p.current() {
-                T!['{'] => record_field_list(p),
-                T!['('] => tuple_field_list(p),
-                _ => (),
-            }
-
-            // test variant_discriminant
-            // enum E { X(i32) = 10 }
-            if p.eat(T![=]) {
-                expressions::expr(p);
-            }
-            m.complete(p, VARIANT);
+        } else if p.at(T![_]) {
+            p.bump(T![_]);
         } else {
             m.abandon(p);
-            p.err_and_bump("expected enum variant");
+            // test_err enum_variant_attrs_without_variant
+            // enum E {#[attr]}
+            if !p.at(T!['}']) {
+                p.err_and_bump("expected enum variant");
+            } else {
+                p.error("expected enum variant");
+            }
+            return;
         }
+        match p.current() {
+            T!['{'] => record_field_list(p),
+            T!['('] => tuple_field_list(p),
+            _ => (),
+        }
+
+        // test variant_discriminant
+        // enum E { X(i32) = 10 }
+        if p.eat(T![=]) {
+            let m = p.start();
+            expressions::expr(p);
+            m.complete(p, CONST_ARG);
+        }
+        m.complete(p, VARIANT);
     }
 }
 
 // test record_field_list
-// struct S { a: i32, b: f32 }
-pub(crate) fn record_field_list(p: &mut Parser) {
+// struct S { a: i32, b: f32, unsafe c: u8 }
+pub(crate) fn record_field_list(p: &mut Parser<'_>) {
     assert!(p.at(T!['{']));
     let m = p.start();
     p.bump(T!['{']);
@@ -123,46 +136,110 @@ pub(crate) fn record_field_list(p: &mut Parser) {
     p.expect(T!['}']);
     m.complete(p, RECORD_FIELD_LIST);
 
-    fn record_field(p: &mut Parser) {
+    fn record_field(p: &mut Parser<'_>) {
         let m = p.start();
         // test record_field_attrs
         // struct S { #[attr] f: f32 }
         attributes::outer_attrs(p);
-        opt_visibility(p);
+        opt_visibility(p, false);
+
+        if p.at(T![mut]) && p.nth(1) == T!['('] {
+            // test record_mut_restrictions_before
+            // struct Foo { mut(super) unsafe i: i32 }
+            let m = p.start();
+            p.bump(T![mut]);
+            if !opt_visibility_inner(p, false) {
+                p.error("expected a mut restriction");
+            }
+            m.complete(p, MUT_RESTRICTION);
+        }
+
+        // We accept mut restriction both after and before `unsafe`, as the order is undecided yet.
+        if p.eat(T![unsafe]) && p.at(T![mut]) && p.nth(1) == T!['('] {
+            // test record_mut_restrictions_after
+            // struct Foo { unsafe mut(super) i: i32 }
+            let m = p.start();
+            p.bump(T![mut]);
+            if !opt_visibility_inner(p, false) {
+                p.error("expected a mut restriction");
+            }
+            m.complete(p, MUT_RESTRICTION);
+        }
+
         if p.at(IDENT) {
             name(p);
             p.expect(T![:]);
             types::type_(p);
+            // test record_field_default_values
+            // struct S { f: f32 = 0.0 }
+            if p.eat(T![=]) {
+                let m = p.start();
+                expressions::expr(p);
+                m.complete(p, CONST_ARG);
+            }
             m.complete(p, RECORD_FIELD);
         } else {
             m.abandon(p);
-            p.err_and_bump("expected field declaration");
+            // test_err record_field_attrs_without_field
+            // struct S {#[attr]}
+            // struct S {#[attr],}
+            if !p.at(T!['}']) {
+                p.err_and_bump("expected field declaration");
+            } else {
+                p.error("expected field declaration");
+            }
         }
     }
 }
 
-fn tuple_field_list(p: &mut Parser) {
+const TUPLE_FIELD_FIRST: TokenSet =
+    types::TYPE_FIRST.union(OUTER_ATTR_FIRST).union(VISIBILITY_FIRST);
+
+// test_err tuple_field_list_recovery
+// struct S(struct S;
+// struct S(A,,B);
+fn tuple_field_list(p: &mut Parser<'_>) {
     assert!(p.at(T!['(']));
     let m = p.start();
-    p.bump(T!['(']);
-    while !p.at(T![')']) && !p.at(EOF) {
-        let m = p.start();
-        // test tuple_field_attrs
-        // struct S (#[attr] f32);
-        attributes::outer_attrs(p);
-        opt_visibility(p);
-        if !p.at_ts(types::TYPE_FIRST) {
-            p.error("expected a type");
-            m.complete(p, ERROR);
-            break;
-        }
-        types::type_(p);
-        m.complete(p, TUPLE_FIELD);
+    delimited(
+        p,
+        T!['('],
+        T![')'],
+        T![,],
+        || "expected tuple field".into(),
+        TUPLE_FIELD_FIRST,
+        |p| {
+            let m = p.start();
+            // test tuple_field_attrs
+            // struct S (#[attr] f32);
+            attributes::outer_attrs(p);
+            let has_vis = opt_visibility(p, true);
 
-        if !p.at(T![')']) {
-            p.expect(T![,]);
-        }
-    }
-    p.expect(T![')']);
+            if p.at(T![mut]) && p.nth(1) == T!['('] {
+                // test tuple_mut_restrictions
+                // struct Foo(pub(crate) mut(super) i32);
+                let m = p.start();
+                p.bump(T![mut]);
+                if !opt_visibility_inner(p, false) {
+                    p.error("expected a mut restriction");
+                }
+                m.complete(p, MUT_RESTRICTION);
+            }
+
+            if !p.at_ts(types::TYPE_FIRST) {
+                p.error("expected a type");
+                if has_vis {
+                    m.complete(p, ERROR);
+                } else {
+                    m.abandon(p);
+                }
+                return false;
+            }
+            types::type_(p);
+            m.complete(p, TUPLE_FIELD);
+            true
+        },
+    );
+
     m.complete(p, TUPLE_FIELD_LIST);
 }

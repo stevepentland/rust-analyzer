@@ -5,7 +5,9 @@
 //! what is used by LSP, so let's keep it simple.
 use std::fmt;
 
-#[derive(Default, Debug)]
+use ide_db::impl_empty_upmap_from_ra_fixture;
+
+#[derive(Clone, Default, Debug, Hash, PartialEq, Eq)]
 pub struct Markup {
     text: String,
 }
@@ -32,7 +34,12 @@ impl Markup {
     pub fn as_str(&self) -> &str {
         self.text.as_str()
     }
-    pub fn fenced_block(contents: &impl fmt::Display) -> Markup {
-        format!("```rust\n{}\n```", contents).into()
+    pub fn fenced_block(contents: impl fmt::Display) -> Markup {
+        format!("```rust\n{contents}\n```").into()
+    }
+    pub fn fenced_block_text(contents: impl fmt::Display) -> Markup {
+        format!("```text\n{contents}\n```").into()
     }
 }
+
+impl_empty_upmap_from_ra_fixture!(Markup);

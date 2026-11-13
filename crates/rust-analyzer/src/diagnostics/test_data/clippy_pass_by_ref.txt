@@ -23,9 +23,7 @@
                 },
             },
             severity: Some(
-                DiagnosticSeverity(
-                    2,
-                ),
+                Warning,
             ),
             code: Some(
                 String(
@@ -56,7 +54,10 @@
             source: Some(
                 "clippy",
             ),
-            message: "this argument is passed by reference, but would be more efficient if passed by value\n#[warn(clippy::trivially_copy_pass_by_ref)] implied by #[warn(clippy::all)]\nfor further information visit https://rust-lang.github.io/rust-clippy/master/index.html#trivially_copy_pass_by_ref",
+            message: String(
+                "this argument is passed by reference, but would be more efficient if passed by value\n#[warn(clippy::trivially_copy_pass_by_ref)] implied by #[warn(clippy::all)]\nfor further information visit https://rust-lang.github.io/rust-clippy/master/index.html#trivially_copy_pass_by_ref",
+            ),
+            tags: None,
             related_information: Some(
                 [
                     DiagnosticRelatedInformation {
@@ -113,10 +114,9 @@
                     },
                 ],
             ),
-            tags: None,
             data: None,
         },
-        fixes: [],
+        fix: None,
     },
     MappedRustDiagnostic {
         url: Url {
@@ -142,9 +142,7 @@
                 },
             },
             severity: Some(
-                DiagnosticSeverity(
-                    4,
-                ),
+                Hint,
             ),
             code: Some(
                 String(
@@ -175,7 +173,10 @@
             source: Some(
                 "clippy",
             ),
-            message: "lint level defined here",
+            message: String(
+                "lint level defined here",
+            ),
+            tags: None,
             related_information: Some(
                 [
                     DiagnosticRelatedInformation {
@@ -206,10 +207,9 @@
                     },
                 ],
             ),
-            tags: None,
             data: None,
         },
-        fixes: [],
+        fix: None,
     },
     MappedRustDiagnostic {
         url: Url {
@@ -235,9 +235,7 @@
                 },
             },
             severity: Some(
-                DiagnosticSeverity(
-                    4,
-                ),
+                Hint,
             ),
             code: Some(
                 String(
@@ -268,7 +266,10 @@
             source: Some(
                 "clippy",
             ),
-            message: "consider passing by value instead: `self`",
+            message: String(
+                "consider passing by value instead: `self`",
+            ),
+            tags: None,
             related_information: Some(
                 [
                     DiagnosticRelatedInformation {
@@ -299,58 +300,8 @@
                     },
                 ],
             ),
-            tags: None,
             data: None,
         },
-        fixes: [
-            CodeAction {
-                title: "consider passing by value instead: `self`",
-                group: None,
-                kind: Some(
-                    CodeActionKind(
-                        "quickfix",
-                    ),
-                ),
-                edit: Some(
-                    SnippetWorkspaceEdit {
-                        changes: Some(
-                            {
-                                Url {
-                                    scheme: "file",
-                                    cannot_be_a_base: false,
-                                    username: "",
-                                    password: None,
-                                    host: None,
-                                    port: None,
-                                    path: "/test/compiler/mir/tagset.rs",
-                                    query: None,
-                                    fragment: None,
-                                }: [
-                                    TextEdit {
-                                        range: Range {
-                                            start: Position {
-                                                line: 41,
-                                                character: 23,
-                                            },
-                                            end: Position {
-                                                line: 41,
-                                                character: 28,
-                                            },
-                                        },
-                                        new_text: "self",
-                                    },
-                                ],
-                            },
-                        ),
-                        document_changes: None,
-                        change_annotations: None,
-                    },
-                ),
-                is_preferred: Some(
-                    true,
-                ),
-                data: None,
-            },
-        ],
+        fix: None,
     },
 ]

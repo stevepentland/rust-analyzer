@@ -23,9 +23,7 @@
                 },
             },
             severity: Some(
-                DiagnosticSeverity(
-                    1,
-                ),
+                Error,
             ),
             code: Some(
                 String(
@@ -56,11 +54,13 @@
             source: Some(
                 "rustc",
             ),
-            message: "mismatched types\nexpected usize, found u32",
-            related_information: None,
+            message: String(
+                "mismatched types\nexpected usize, found u32",
+            ),
             tags: None,
+            related_information: None,
             data: None,
         },
-        fixes: [],
+        fix: None,
     },
 ]

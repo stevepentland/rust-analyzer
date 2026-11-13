@@ -7,78 +7,94 @@
 //!
 //! This binary is integrated into the `cargo` command line by using an alias in
 //! `.cargo/config`.
+
+#![warn(rust_2018_idioms, unused_lifetimes)]
+#![allow(
+    clippy::print_stderr,
+    clippy::print_stdout,
+    clippy::disallowed_methods,
+    // 1. We want to be dependency-light
+    // 2. Speed of hash maps doesn't matter, as xtask is dev tooling
+    clippy::disallowed_types
+)]
+
 mod flags;
 
-mod install;
-mod release;
+mod codegen;
 mod dist;
+mod install;
 mod metrics;
+mod pgo;
+mod publish;
+mod release;
+mod tidy;
+mod util;
 
-use anyhow::{bail, Result};
-use std::{
-    env,
-    path::{Path, PathBuf},
-};
-use xshell::{cmd, cp, pushd, pushenv};
+use anyhow::bail;
+use std::{env, path::PathBuf};
+use xshell::{Shell, cmd};
 
-fn main() -> Result<()> {
-    let _d = pushd(project_root())?;
+fn main() -> anyhow::Result<()> {
+    let flags = flags::Xtask::from_env_or_exit();
 
-    let flags = flags::Xtask::from_env()?;
+    let sh = &Shell::new()?;
+    sh.change_dir(project_root());
+
     match flags.subcommand {
-        flags::XtaskCmd::Help(_) => {
-            println!("{}", flags::Xtask::HELP);
-            Ok(())
-        }
-        flags::XtaskCmd::Install(cmd) => cmd.run(),
-        flags::XtaskCmd::FuzzTests(_) => run_fuzzer(),
-        flags::XtaskCmd::Release(cmd) => cmd.run(),
-        flags::XtaskCmd::Promote(cmd) => cmd.run(),
-        flags::XtaskCmd::Dist(cmd) => cmd.run(),
-        flags::XtaskCmd::Metrics(cmd) => cmd.run(),
+        flags::XtaskCmd::Install(cmd) => cmd.run(sh),
+        flags::XtaskCmd::FuzzTests(_) => run_fuzzer(sh),
+        flags::XtaskCmd::Release(cmd) => cmd.run(sh),
+        flags::XtaskCmd::Dist(cmd) => cmd.run(sh),
+        flags::XtaskCmd::PublishReleaseNotes(cmd) => cmd.run(sh),
+        flags::XtaskCmd::Metrics(cmd) => cmd.run(sh),
+        flags::XtaskCmd::Codegen(cmd) => cmd.run(sh),
         flags::XtaskCmd::Bb(cmd) => {
             {
-                let _d = pushd("./crates/rust-analyzer")?;
-                cmd!("cargo build --release --features jemalloc").run()?;
+                let _d = sh.push_dir("./crates/rust-analyzer");
+                cmd!(sh, "cargo build --release --features jemalloc").run()?;
             }
-            cp("./target/release/rust-analyzer", format!("./target/rust-analyzer-{}", cmd.suffix))?;
+            sh.copy_file(
+                "./target/release/rust-analyzer",
+                format!("./target/rust-analyzer-{}", cmd.suffix),
+            )?;
             Ok(())
         }
+        flags::XtaskCmd::Tidy(cmd) => cmd.run(sh),
     }
 }
 
+/// Returns the path to the root directory of `rust-analyzer` project.
 fn project_root() -> PathBuf {
-    Path::new(
-        &env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| env!("CARGO_MANIFEST_DIR").to_owned()),
-    )
-    .ancestors()
-    .nth(1)
-    .unwrap()
-    .to_path_buf()
+    let dir =
+        env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| env!("CARGO_MANIFEST_DIR").to_owned());
+    PathBuf::from(dir).parent().unwrap().to_owned()
 }
 
-fn run_fuzzer() -> Result<()> {
-    let _d = pushd("./crates/syntax")?;
-    let _e = pushenv("RUSTUP_TOOLCHAIN", "nightly");
-    if cmd!("cargo fuzz --help").read().is_err() {
-        cmd!("cargo install cargo-fuzz").run()?;
+fn run_fuzzer(sh: &Shell) -> anyhow::Result<()> {
+    let _d = sh.push_dir("./crates/syntax");
+    let _e = sh.push_env("RUSTUP_TOOLCHAIN", "nightly");
+    if cmd!(sh, "cargo fuzz --help").read().is_err() {
+        cmd!(sh, "cargo install --locked cargo-fuzz").run()?;
     };
 
     // Expecting nightly rustc
-    let out = cmd!("rustc --version").read()?;
+    let out = cmd!(sh, "rustc --version").read()?;
     if !out.contains("nightly") {
         bail!("fuzz tests require nightly rustc")
     }
 
-    cmd!("cargo fuzz run parser").run()?;
+    cmd!(sh, "cargo fuzz run parser").run()?;
     Ok(())
 }
 
-fn date_iso() -> Result<String> {
-    let res = cmd!("date -u +%Y-%m-%d").read()?;
+fn date_iso(sh: &Shell) -> anyhow::Result<String> {
+    let res = cmd!(sh, "date -u +%Y-%m-%d").read()?;
     Ok(res)
 }
 
 fn is_release_tag(tag: &str) -> bool {
-    tag.len() == "2020-02-24".len() && tag.starts_with(|c: char| c.is_ascii_digit())
+    tag.len() >= 10
+        && tag.starts_with(|c: char| c.is_ascii_digit())
+        && tag.as_bytes()[4] == b'-'
+        && tag.as_bytes()[7] == b'-'
 }

@@ -1,5 +1,10 @@
 //! cfg defines conditional compiling options, `cfg` attribute parser and evaluator
 
+#![cfg_attr(feature = "in-rust-tree", feature(rustc_private))]
+
+#[cfg(feature = "in-rust-tree")]
+extern crate rustc_driver as _;
+
 mod cfg_expr;
 mod dnf;
 #[cfg(test)]
@@ -8,7 +13,8 @@ mod tests;
 use std::fmt;
 
 use rustc_hash::FxHashSet;
-use tt::SmolStr;
+
+use intern::{Symbol, sym};
 
 pub use cfg_expr::{CfgAtom, CfgExpr};
 pub use dnf::DnfExpr;
@@ -23,9 +29,15 @@ pub use dnf::DnfExpr;
 /// of key and value in `key_values`.
 ///
 /// See: <https://doc.rust-lang.org/reference/conditional-compilation.html#set-configuration-options>
-#[derive(Clone, PartialEq, Eq, Default)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct CfgOptions {
     enabled: FxHashSet<CfgAtom>,
+}
+
+impl Default for CfgOptions {
+    fn default() -> Self {
+        Self { enabled: FxHashSet::from_iter([CfgAtom::Flag(sym::true_)]) }
+    }
 }
 
 impl fmt::Debug for CfgOptions {
@@ -35,7 +47,7 @@ impl fmt::Debug for CfgOptions {
             .iter()
             .map(|atom| match atom {
                 CfgAtom::Flag(it) => it.to_string(),
-                CfgAtom::KeyValue { key, value } => format!("{}={}", key, value),
+                CfgAtom::KeyValue { key, value } => format!("{key}={value}"),
             })
             .collect::<Vec<_>>();
         items.sort();
@@ -48,46 +60,110 @@ impl CfgOptions {
         cfg.fold(&|atom| self.enabled.contains(atom))
     }
 
-    pub fn insert_atom(&mut self, key: SmolStr) {
-        self.enabled.insert(CfgAtom::Flag(key));
+    pub fn check_atom(&self, cfg: &CfgAtom) -> bool {
+        self.enabled.contains(cfg)
     }
 
-    pub fn insert_key_value(&mut self, key: SmolStr, value: SmolStr) {
-        self.enabled.insert(CfgAtom::KeyValue { key, value });
+    pub fn insert_atom(&mut self, key: Symbol) {
+        self.insert_any_atom(CfgAtom::Flag(key));
+    }
+
+    pub fn insert_key_value(&mut self, key: Symbol, value: Symbol) {
+        self.insert_any_atom(CfgAtom::KeyValue { key, value });
     }
 
     pub fn apply_diff(&mut self, diff: CfgDiff) {
         for atom in diff.enable {
-            self.enabled.insert(atom);
+            self.insert_any_atom(atom);
         }
 
         for atom in diff.disable {
+            let (CfgAtom::Flag(sym) | CfgAtom::KeyValue { key: sym, .. }) = &atom;
+            if *sym == sym::true_ || *sym == sym::false_ {
+                tracing::error!("cannot remove `true` or `false` from cfg");
+                continue;
+            }
             self.enabled.remove(&atom);
         }
     }
 
-    pub fn get_cfg_keys(&self) -> Vec<&SmolStr> {
-        self.enabled
-            .iter()
-            .map(|x| match x {
-                CfgAtom::Flag(key) => key,
-                CfgAtom::KeyValue { key, .. } => key,
-            })
-            .collect()
+    fn insert_any_atom(&mut self, atom: CfgAtom) {
+        let (CfgAtom::Flag(sym) | CfgAtom::KeyValue { key: sym, .. }) = &atom;
+        if *sym == sym::true_ || *sym == sym::false_ {
+            tracing::error!("cannot insert `true` or `false` to cfg");
+            return;
+        }
+        self.enabled.insert(atom);
     }
 
-    pub fn get_cfg_values(&self, cfg_key: &str) -> Vec<&SmolStr> {
-        self.enabled
-            .iter()
-            .filter_map(|x| match x {
-                CfgAtom::KeyValue { key, value } if cfg_key == key => Some(value),
-                _ => None,
-            })
-            .collect()
+    pub fn get_cfg_keys(&self) -> impl Iterator<Item = &Symbol> {
+        self.enabled.iter().map(|it| match it {
+            CfgAtom::Flag(key) => key,
+            CfgAtom::KeyValue { key, .. } => key,
+        })
+    }
+
+    pub fn get_cfg_values<'a>(&'a self, cfg_key: &'a str) -> impl Iterator<Item = &'a Symbol> + 'a {
+        self.enabled.iter().filter_map(move |it| match it {
+            CfgAtom::KeyValue { key, value } if cfg_key == key.as_str() => Some(value),
+            _ => None,
+        })
+    }
+
+    pub fn to_hashable(&self) -> HashableCfgOptions {
+        let mut enabled = self.enabled.iter().cloned().collect::<Box<[_]>>();
+        enabled.sort_unstable();
+        HashableCfgOptions { _enabled: enabled }
+    }
+
+    #[inline]
+    pub fn shrink_to_fit(&mut self) {
+        self.enabled.shrink_to_fit();
+    }
+
+    pub fn append(&mut self, other: CfgOptions) {
+        // Do not call `insert_any_atom()`, as it'll check for `true` and `false`, but this is not
+        // needed since we already checked for that when constructing `other`. Furthermore, this
+        // will always err, as `other` inevitably contains `true` (just as we do).
+        self.enabled.extend(other.enabled);
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+impl Extend<CfgAtom> for CfgOptions {
+    fn extend<T: IntoIterator<Item = CfgAtom>>(&mut self, iter: T) {
+        iter.into_iter().for_each(|cfg_flag| self.insert_any_atom(cfg_flag));
+    }
+}
+
+impl IntoIterator for CfgOptions {
+    type Item = <FxHashSet<CfgAtom> as IntoIterator>::Item;
+
+    type IntoIter = <FxHashSet<CfgAtom> as IntoIterator>::IntoIter;
+
+    fn into_iter(self) -> Self::IntoIter {
+        <FxHashSet<CfgAtom> as IntoIterator>::into_iter(self.enabled)
+    }
+}
+
+impl<'a> IntoIterator for &'a CfgOptions {
+    type Item = <&'a FxHashSet<CfgAtom> as IntoIterator>::Item;
+
+    type IntoIter = <&'a FxHashSet<CfgAtom> as IntoIterator>::IntoIter;
+
+    fn into_iter(self) -> Self::IntoIter {
+        <&FxHashSet<CfgAtom> as IntoIterator>::into_iter(&self.enabled)
+    }
+}
+
+impl FromIterator<CfgAtom> for CfgOptions {
+    fn from_iter<T: IntoIterator<Item = CfgAtom>>(iter: T) -> Self {
+        let mut options = CfgOptions::default();
+        options.extend(iter);
+        options
+    }
+}
+
+#[derive(Default, Clone, Debug, PartialEq, Eq)]
 pub struct CfgDiff {
     // Invariants: No duplicates, no atom that's both in `enable` and `disable`.
     enable: Vec<CfgAtom>,
@@ -95,18 +171,20 @@ pub struct CfgDiff {
 }
 
 impl CfgDiff {
-    /// Create a new CfgDiff. Will return None if the same item appears more than once in the set
-    /// of both.
-    pub fn new(enable: Vec<CfgAtom>, disable: Vec<CfgAtom>) -> Option<CfgDiff> {
-        let mut occupied = FxHashSet::default();
-        for item in enable.iter().chain(disable.iter()) {
-            if !occupied.insert(item) {
-                // was present
-                return None;
+    /// Create a new CfgDiff.
+    pub fn new(mut enable: Vec<CfgAtom>, mut disable: Vec<CfgAtom>) -> CfgDiff {
+        enable.sort();
+        enable.dedup();
+        disable.sort();
+        disable.dedup();
+        for i in (0..enable.len()).rev() {
+            if let Some(j) = disable.iter().position(|atom| *atom == enable[i]) {
+                enable.remove(i);
+                disable.remove(j);
             }
         }
 
-        Some(CfgDiff { enable, disable })
+        CfgDiff { enable, disable }
     }
 
     /// Returns the total number of atoms changed by this diff.
@@ -131,7 +209,7 @@ impl fmt::Display for CfgDiff {
                 };
                 f.write_str(sep)?;
 
-                write!(f, "{}", atom)?;
+                atom.fmt(f)?;
             }
 
             if !self.disable.is_empty() {
@@ -144,12 +222,12 @@ impl fmt::Display for CfgDiff {
             for (i, atom) in self.disable.iter().enumerate() {
                 let sep = match i {
                     0 => "",
-                    _ if i == self.enable.len() - 1 => " and ",
+                    _ if i == self.disable.len() - 1 => " and ",
                     _ => ", ",
                 };
                 f.write_str(sep)?;
 
-                write!(f, "{}", atom)?;
+                atom.fmt(f)?;
             }
         }
 
@@ -173,10 +251,10 @@ impl fmt::Display for InactiveReason {
                 };
                 f.write_str(sep)?;
 
-                write!(f, "{}", atom)?;
+                atom.fmt(f)?;
             }
             let is_are = if self.enabled.len() == 1 { "is" } else { "are" };
-            write!(f, " {} enabled", is_are)?;
+            write!(f, " {is_are} enabled")?;
 
             if !self.disabled.is_empty() {
                 f.write_str(" and ")?;
@@ -192,12 +270,18 @@ impl fmt::Display for InactiveReason {
                 };
                 f.write_str(sep)?;
 
-                write!(f, "{}", atom)?;
+                atom.fmt(f)?;
             }
             let is_are = if self.disabled.len() == 1 { "is" } else { "are" };
-            write!(f, " {} disabled", is_are)?;
+            write!(f, " {is_are} disabled")?;
         }
 
         Ok(())
     }
+}
+
+/// A `CfgOptions` that implements `Hash`, for the sake of hashing only.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct HashableCfgOptions {
+    _enabled: Box<[CfgAtom]>,
 }

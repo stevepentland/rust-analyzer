@@ -11,63 +11,32 @@
 
 use std::{
     hash::{Hash, Hasher},
-    iter::successors,
     marker::PhantomData,
 };
 
-use crate::{AstNode, SyntaxKind, SyntaxNode, TextRange};
+use rowan::TextRange;
 
-/// A pointer to a syntax node inside a file. It can be used to remember a
-/// specific node across reparses of the same file.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct SyntaxNodePtr {
-    // Don't expose this field further. At some point, we might want to replace
-    // range with node id.
-    pub(crate) range: TextRange,
-    kind: SyntaxKind,
-}
+use crate::{AstNode, SyntaxNode, syntax_node::RustLanguage};
 
-impl SyntaxNodePtr {
-    pub fn new(node: &SyntaxNode) -> SyntaxNodePtr {
-        SyntaxNodePtr { range: node.text_range(), kind: node.kind() }
-    }
+/// A "pointer" to a [`SyntaxNode`], via location in the source code.
+pub type SyntaxNodePtr = rowan::ast::SyntaxNodePtr<RustLanguage>;
 
-    /// "Dereference" the pointer to get the node it points to.
-    ///
-    /// Panics if node is not found, so make sure that `root` syntax tree is
-    /// equivalent (is build from the same text) to the tree which was
-    /// originally used to get this [`SyntaxNodePtr`].
-    ///
-    /// The complexity is linear in the depth of the tree and logarithmic in
-    /// tree width. As most trees are shallow, thinking about this as
-    /// `O(log(N))` in the size of the tree is not too wrong!
-    pub fn to_node(&self, root: &SyntaxNode) -> SyntaxNode {
-        assert!(root.parent().is_none());
-        successors(Some(root.clone()), |node| {
-            node.child_or_token_at_range(self.range).and_then(|it| it.into_node())
-        })
-        .find(|it| it.text_range() == self.range && it.kind() == self.kind)
-        .unwrap_or_else(|| panic!("can't resolve local ptr to SyntaxNode: {:?}", self))
-    }
-
-    pub fn cast<N: AstNode>(self) -> Option<AstPtr<N>> {
-        if !N::can_cast(self.kind) {
-            return None;
-        }
-        Some(AstPtr { raw: self, _ty: PhantomData })
-    }
-}
-
-/// Like `SyntaxNodePtr`, but remembers the type of node
-#[derive(Debug)]
+/// Like [`SyntaxNodePtr`], but remembers the type of node.
 pub struct AstPtr<N: AstNode> {
     raw: SyntaxNodePtr,
     _ty: PhantomData<fn() -> N>,
 }
 
+impl<N: AstNode> std::fmt::Debug for AstPtr<N> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("AstPtr").field(&self.raw).finish()
+    }
+}
+
+impl<N: AstNode> Copy for AstPtr<N> {}
 impl<N: AstNode> Clone for AstPtr<N> {
     fn clone(&self) -> AstPtr<N> {
-        AstPtr { raw: self.raw.clone(), _ty: PhantomData }
+        *self
     }
 }
 
@@ -96,14 +65,48 @@ impl<N: AstNode> AstPtr<N> {
     }
 
     pub fn syntax_node_ptr(&self) -> SyntaxNodePtr {
-        self.raw.clone()
+        self.raw
+    }
+
+    pub fn text_range(self) -> TextRange {
+        self.raw.text_range()
     }
 
     pub fn cast<U: AstNode>(self) -> Option<AstPtr<U>> {
-        if !U::can_cast(self.raw.kind) {
+        if !U::can_cast(self.raw.kind()) {
             return None;
         }
         Some(AstPtr { raw: self.raw, _ty: PhantomData })
+    }
+
+    pub fn kind(&self) -> parser::SyntaxKind {
+        self.raw.kind()
+    }
+
+    pub fn upcast<M: AstNode>(self) -> AstPtr<M>
+    where
+        N: Into<M>,
+    {
+        AstPtr { raw: self.raw, _ty: PhantomData }
+    }
+
+    /// Like [`SyntaxNodePtr::cast`] but the trait bounds work out.
+    pub fn try_from_raw(raw: SyntaxNodePtr) -> Option<AstPtr<N>> {
+        N::can_cast(raw.kind()).then_some(AstPtr { raw, _ty: PhantomData })
+    }
+
+    pub fn wrap_left<R>(self) -> AstPtr<either::Either<N, R>>
+    where
+        either::Either<N, R>: AstNode,
+    {
+        AstPtr { raw: self.raw, _ty: PhantomData }
+    }
+
+    pub fn wrap_right<L>(self) -> AstPtr<either::Either<L, N>>
+    where
+        either::Either<L, N>: AstNode,
+    {
+        AstPtr { raw: self.raw, _ty: PhantomData }
     }
 }
 
@@ -115,9 +118,9 @@ impl<N: AstNode> From<AstPtr<N>> for SyntaxNodePtr {
 
 #[test]
 fn test_local_syntax_ptr() {
-    use crate::{ast, AstNode, SourceFile};
+    use crate::{AstNode, SourceFile, ast};
 
-    let file = SourceFile::parse("struct Foo { f: u32, }").ok().unwrap();
+    let file = SourceFile::parse("struct Foo { f: u32, }", parser::Edition::CURRENT).ok().unwrap();
     let field = file.syntax().descendants().find_map(ast::RecordField::cast).unwrap();
     let ptr = SyntaxNodePtr::new(field.syntax());
     let field_syntax = ptr.to_node(file.syntax());

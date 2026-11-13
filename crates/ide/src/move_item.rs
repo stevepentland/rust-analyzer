@@ -1,10 +1,11 @@
 use std::{iter::once, mem};
 
 use hir::Semantics;
-use ide_db::{base_db::FileRange, helpers::pick_best_token, RootDatabase};
+use ide_db::syntax_helpers::tree_diff::diff;
+use ide_db::text_edit::{TextEdit, TextEditBuilder};
+use ide_db::{FileRange, RootDatabase, helpers::pick_best_token};
 use itertools::Itertools;
-use syntax::{algo, ast, match_ast, AstNode, SyntaxElement, SyntaxKind, SyntaxNode, TextRange};
-use text_edit::{TextEdit, TextEditBuilder};
+use syntax::{AstNode, SyntaxElement, SyntaxKind, SyntaxNode, TextRange, ast, match_ast};
 
 #[derive(Copy, Clone, Debug)]
 pub enum Direction {
@@ -16,21 +17,19 @@ pub enum Direction {
 //
 // Move item under cursor or selection up and down.
 //
-// |===
-// | Editor  | Action Name
+// | Editor  | Action Name |
+// |---------|-------------|
+// | VS Code | **rust-analyzer: Move item up**
+// | VS Code | **rust-analyzer: Move item down**
 //
-// | VS Code | **Rust Analyzer: Move item up**
-// | VS Code | **Rust Analyzer: Move item down**
-// |===
-//
-// image::https://user-images.githubusercontent.com/48062697/113065576-04298180-91b1-11eb-91ce-4505e99ed598.gif[]
+// ![Move Item](https://user-images.githubusercontent.com/48062697/113065576-04298180-91b1-11eb-91ce-4505e99ed598.gif)
 pub(crate) fn move_item(
     db: &RootDatabase,
     range: FileRange,
     direction: Direction,
 ) -> Option<TextEdit> {
     let sema = Semantics::new(db);
-    let file = sema.parse(range.file_id);
+    let file = sema.parse_guess_edition(range.file_id);
 
     let item = if range.range.is_empty() {
         SyntaxElement::Token(pick_best_token(
@@ -120,12 +119,12 @@ fn swap_sibling_in_list<A: AstNode + Clone, I: Iterator<Item = A>>(
     range: TextRange,
     direction: Direction,
 ) -> Option<TextEdit> {
-    let list_lookup = list.tuple_windows().find(|(l, r)| match direction {
+    let list_lookup = list.array_windows().find(|[l, r]| match direction {
         Direction::Up => r.syntax().text_range().contains_range(range),
         Direction::Down => l.syntax().text_range().contains_range(range),
     });
 
-    if let Some((l, r)) = list_lookup {
+    if let Some([l, r]) = list_lookup {
         Some(replace_nodes(range, l.syntax(), r.syntax()))
     } else {
         // Cursor is beyond any movable list item (for example, on curly brace in enum).
@@ -165,7 +164,7 @@ fn replace_nodes<'a>(
 
     let mut edit = TextEditBuilder::default();
 
-    algo::diff(first, second).into_text_edit(&mut edit);
+    diff(first, second).into_text_edit(&mut edit);
     edit.replace(second.text_range(), first_with_cursor);
 
     edit.finish()
@@ -174,11 +173,15 @@ fn replace_nodes<'a>(
 #[cfg(test)]
 mod tests {
     use crate::fixture;
-    use expect_test::{expect, Expect};
+    use expect_test::{Expect, expect};
 
     use crate::Direction;
 
-    fn check(ra_fixture: &str, expect: Expect, direction: Direction) {
+    fn check(
+        #[rust_analyzer::rust_fixture] ra_fixture: &str,
+        expect: Expect,
+        direction: Direction,
+    ) {
         let (analysis, range) = fixture::range(ra_fixture);
         let edit = analysis.move_item(range, direction).unwrap().unwrap_or_default();
         let mut file = analysis.file_text(range.file_id).unwrap().to_string();

@@ -1,58 +1,61 @@
 //! Lexing, bridging to parser (which does the actual parsing) and
 //! incremental reparsing.
 
-pub(crate) mod lexer;
-mod text_token_source;
-mod text_tree_sink;
 mod reparsing;
 
-use parser::SyntaxKind;
-use text_token_source::TextTokenSource;
-use text_tree_sink::TextTreeSink;
+use rowan::TextRange;
 
-use crate::{syntax_node::GreenNode, AstNode, SyntaxError, SyntaxNode};
+use crate::{SyntaxError, SyntaxTreeBuilder, syntax_node::GreenNode};
 
-pub(crate) use crate::parsing::{lexer::*, reparsing::incremental_reparse};
+pub(crate) use crate::parsing::reparsing::incremental_reparse;
 
-pub(crate) fn parse_text(text: &str) -> (GreenNode, Vec<SyntaxError>) {
-    let (tokens, lexer_errors) = tokenize(text);
-
-    let mut token_source = TextTokenSource::new(text, &tokens);
-    let mut tree_sink = TextTreeSink::new(text, &tokens);
-
-    parser::parse_source_file(&mut token_source, &mut tree_sink);
-
-    let (tree, mut parser_errors) = tree_sink.finish();
-    parser_errors.extend(lexer_errors);
-
-    (tree, parser_errors)
+pub(crate) fn parse_text(text: &str, edition: parser::Edition) -> (GreenNode, Vec<SyntaxError>) {
+    let _p = tracing::info_span!("parse_text").entered();
+    let lexed = parser::LexedStr::new(edition, text);
+    let parser_input = lexed.to_input(edition);
+    let parser_output = parser::TopEntryPoint::SourceFile.parse(&parser_input);
+    let (node, errors, _eof) = build_tree(lexed, parser_output);
+    (node, errors)
 }
 
-/// Returns `text` parsed as a `T` provided there are no parse errors.
-pub(crate) fn parse_text_as<T: AstNode>(
+pub(crate) fn parse_text_at(
     text: &str,
-    entry_point: parser::ParserEntryPoint,
-) -> Result<T, ()> {
-    let (tokens, lexer_errors) = tokenize(text);
-    if !lexer_errors.is_empty() {
-        return Err(());
+    entry: parser::TopEntryPoint,
+    edition: parser::Edition,
+) -> (GreenNode, Vec<SyntaxError>) {
+    let _p = tracing::info_span!("parse_text_at").entered();
+    let lexed = parser::LexedStr::new(edition, text);
+    let parser_input = lexed.to_input(edition);
+    let parser_output = entry.parse(&parser_input);
+    let (node, errors, _eof) = build_tree(lexed, parser_output);
+    (node, errors)
+}
+
+pub(crate) fn build_tree(
+    lexed: parser::LexedStr<'_>,
+    parser_output: parser::Output,
+) -> (GreenNode, Vec<SyntaxError>, bool) {
+    let _p = tracing::info_span!("build_tree").entered();
+    let mut builder = SyntaxTreeBuilder::default();
+
+    let is_eof = lexed.intersperse_trivia(&parser_output, &mut |step| match step {
+        parser::StrStep::Token { kind, text } => builder.token(kind, text),
+        parser::StrStep::Enter { kind } => builder.start_node(kind),
+        parser::StrStep::Exit => builder.finish_node(),
+        parser::StrStep::Error { msg, pos } => {
+            builder.error(msg.to_owned(), pos.try_into().unwrap())
+        }
+    });
+
+    let (node, mut errors) = builder.finish_raw();
+    for (i, err) in lexed.errors() {
+        let text_range = lexed.text_range(i);
+        let text_range = TextRange::new(
+            text_range.start.try_into().unwrap(),
+            text_range.end.try_into().unwrap(),
+        );
+        errors.push(SyntaxError::new(err, text_range))
     }
 
-    let mut token_source = TextTokenSource::new(text, &tokens);
-    let mut tree_sink = TextTreeSink::new(text, &tokens);
-
-    // TextTreeSink assumes that there's at least some root node to which it can attach errors and
-    // tokens. We arbitrarily give it a SourceFile.
-    use parser::TreeSink;
-    tree_sink.start_node(SyntaxKind::SOURCE_FILE);
-    parser::parse(&mut token_source, &mut tree_sink, entry_point);
-    tree_sink.finish_node();
-
-    let (tree, parser_errors) = tree_sink.finish();
-    use parser::TokenSource;
-    if !parser_errors.is_empty() || token_source.current().kind != SyntaxKind::EOF {
-        return Err(());
-    }
-
-    SyntaxNode::new_root(tree).first_child().and_then(T::cast).ok_or(())
+    (node, errors, is_eof)
 }

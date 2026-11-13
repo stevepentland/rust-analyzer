@@ -9,20 +9,15 @@ use rustc_hash::FxHasher;
 use crate::{FileId, VfsPath};
 
 /// Structure to map between [`VfsPath`] and [`FileId`].
+#[derive(Default)]
 pub(crate) struct PathInterner {
     map: IndexSet<VfsPath, BuildHasherDefault<FxHasher>>,
-}
-
-impl Default for PathInterner {
-    fn default() -> Self {
-        Self { map: IndexSet::default() }
-    }
 }
 
 impl PathInterner {
     /// Get the id corresponding to `path`.
     ///
-    /// If `path` does not exists in `self`, returns [`None`].
+    /// If `path` does not exist in `self`, returns [`None`].
     pub(crate) fn get(&self, path: &VfsPath) -> Option<FileId> {
         self.map.get_index_of(path).map(|i| FileId(i as u32))
     }
@@ -33,7 +28,7 @@ impl PathInterner {
     /// - Else, returns a newly allocated id.
     pub(crate) fn intern(&mut self, path: VfsPath) -> FileId {
         let (id, _added) = self.map.insert_full(path);
-        assert!(id < u32::MAX as usize);
+        assert!(id < FileId::MAX as usize);
         FileId(id as u32)
     }
 
@@ -41,7 +36,7 @@ impl PathInterner {
     ///
     /// # Panics
     ///
-    /// Panics if `id` does not exists in `self`.
+    /// Panics if `id` does not exist in `self`.
     pub(crate) fn lookup(&self, id: FileId) -> &VfsPath {
         self.map.get_index(id.0 as usize).unwrap()
     }
